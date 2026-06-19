@@ -64,9 +64,9 @@ class ACInfinitySwitch(
         self._attr_unique_id = f"{self._device.address}_switch_{slugify(name)}"
         self._attr_device_info = DeviceInfo(
             name=device.name,
-            model=DEVICE_MODEL[device.state.type],
+            model=DEVICE_MODEL.get(device.state.type, "Controller"),
             manufacturer=MANUFACTURER,
-            sw_version=device.state.version,
+            sw_version=str(device.state.version),
             connections={(dr.CONNECTION_BLUETOOTH, device.address)},
         )
         self._get_is_on = get_is_on

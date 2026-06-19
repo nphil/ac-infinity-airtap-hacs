@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ac_infinity_ble.const import MANUFACTURER_ID
+from .ac_infinity_ble.const import MANUFACTURER_ID
 import voluptuous as vol
 
 from homeassistant import config_entries
@@ -21,7 +21,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def parse_manufacturer_data(data: bytes) -> DeviceInfoEx:
-    from ac_infinity_ble.protocol import parse_manufacturer_data as parse
+    from .ac_infinity_ble.protocol import parse_manufacturer_data as parse
     return DeviceInfoEx.create(parse(data))
 
 
@@ -40,6 +40,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
         self._discovery_info = discovery_info
+        if MANUFACTURER_ID not in discovery_info.advertisement.manufacturer_data:
+            return self.async_abort(reason="no_devices_found")
         device: DeviceInfoEx = parse_manufacturer_data(
             discovery_info.advertisement.manufacturer_data[MANUFACTURER_ID]
         )
@@ -102,6 +104,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         devices = {}
         for service_info in self._discovered_devices.values():
+            if MANUFACTURER_ID not in service_info.advertisement.manufacturer_data:
+                continue
             device = parse_manufacturer_data(
                 service_info.advertisement.manufacturer_data[MANUFACTURER_ID]
             )

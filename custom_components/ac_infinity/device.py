@@ -5,10 +5,10 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from ac_infinity_ble import ACInfinityController, DeviceInfo
-from ac_infinity_ble.const import CallbackType, MANUFACTURER_ID
-from ac_infinity_ble.protocol import parse_manufacturer_data
-from ac_infinity_ble.util import get_bit
+from .ac_infinity_ble import ACInfinityController, DeviceInfo
+from .ac_infinity_ble.const import CallbackType, MANUFACTURER_ID
+from .ac_infinity_ble.protocol import parse_manufacturer_data
+from .ac_infinity_ble.util import get_bit
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 

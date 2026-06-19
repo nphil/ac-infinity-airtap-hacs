@@ -5,7 +5,8 @@ import contextlib
 import logging
 
 import async_timeout
-from ac_infinity_ble.const import MANUFACTURER_ID
+from .ac_infinity_ble.const import MANUFACTURER_ID
+from .ac_infinity_ble.exceptions import CharacteristicMissingError
 from bleak.backends.device import BLEDevice
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.active_update_coordinator import \
@@ -62,7 +63,12 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         self, service_info: bluetooth.BluetoothServiceInfoBleak
     ) -> None:
         """Poll the device."""
-        await self.controller.update()
+        try:
+            await self.controller.update()
+        except CharacteristicMissingError:
+            self.logger.debug("%s (%s) transient BLE connection error during poll, will retry",
+                              self.ble_device.name, self.ble_device.address)
+            return
         self.logger.debug("%s (%s) state after poll: %s",
                           self.ble_device.name,
                           self.ble_device.address,
@@ -116,4 +122,4 @@ class ActiveBluetoothCoordinatorEntity[
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return self.coordinator.available and self.coordinator.last_poll_successful
+        return self.coordinator.available

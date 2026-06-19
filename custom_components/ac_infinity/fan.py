@@ -55,13 +55,14 @@ class ACInfinityFan(
     ) -> None:
         super().__init__(coordinator)
         self._device = device
+        self._last_speed = 1
         self._attr_name = name
         self._attr_unique_id = f"{self._device.address}_{slugify(name)}"
         self._attr_device_info = DeviceInfo(
             name=device.name,
-            model=DEVICE_MODEL[device.state.type],
+            model=DEVICE_MODEL.get(device.state.type, "Controller"),
             manufacturer=MANUFACTURER,
-            sw_version=device.state.version,
+            sw_version=str(device.state.version),
             connections={(dr.CONNECTION_BLUETOOTH, device.address)},
         )
 
@@ -70,7 +71,11 @@ class ACInfinityFan(
         speed = 0
         if percentage > 0:
             speed = math.ceil(percentage_to_ranged_value(SPEED_RANGE, percentage))
-
+        if speed > 0:
+            self._last_speed = speed
+        self._attr_is_on = speed > 0
+        self._attr_percentage = percentage
+        self.async_write_ha_state()
         await self._device.set_speed(speed)
 
     async def async_turn_on(
@@ -85,9 +90,17 @@ class ACInfinityFan(
         speed = None
         if percentage is not None:
             speed = math.ceil(percentage_to_ranged_value(SPEED_RANGE, percentage))
+        self._attr_is_on = True
+        if speed is not None and speed > 0:
+            self._last_speed = speed
+            self._attr_percentage = ranged_value_to_percentage(SPEED_RANGE, speed)
+        self.async_write_ha_state()
         await self._device.turn_on(speed)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        self._attr_is_on = False
+        self._attr_percentage = 0
+        self.async_write_ha_state()
         await self._device.turn_off()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:

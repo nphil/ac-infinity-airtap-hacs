@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from ac_infinity_ble import DeviceInfo
+from .ac_infinity_ble import DeviceInfo
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_SERVICE_DATA, Platform

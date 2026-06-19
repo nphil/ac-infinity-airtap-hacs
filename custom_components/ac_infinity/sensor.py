@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from homeassistant.components.bluetooth.passive_update_coordinator import \
-    PassiveBluetoothCoordinatorEntity
 from homeassistant.components.sensor import (SensorDeviceClass, SensorEntity,
                                              SensorStateClass)
 from homeassistant.config_entries import ConfigEntry
@@ -13,7 +11,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import slugify
 
 from .const import DEVICE_MODEL, DOMAIN, FAMILY_E_MODELS, MANUFACTURER
-from .coordinator import ACInfinityDataUpdateCoordinator
+from .coordinator import ACInfinityDataUpdateCoordinator, ActiveBluetoothCoordinatorEntity
 from .device import ACInfinityDevice
 from .models import ACInfinityData
 
@@ -35,7 +33,7 @@ async def async_setup_entry(
 
 
 class ACInfinitySensor(
-    PassiveBluetoothCoordinatorEntity[ACInfinityDataUpdateCoordinator], SensorEntity
+    ActiveBluetoothCoordinatorEntity[ACInfinityDataUpdateCoordinator], SensorEntity
 ):
     _attr_has_entity_name = True
 
@@ -51,9 +49,9 @@ class ACInfinitySensor(
         self._attr_unique_id = f"{self._device.address}_{slugify(name)}"
         self._attr_device_info = DeviceInfo(
             name=device.name,
-            model=DEVICE_MODEL[device.state.type],
+            model=DEVICE_MODEL.get(device.state.type, "Controller"),
             manufacturer=MANUFACTURER,
-            sw_version=device.state.version,
+            sw_version=str(device.state.version),
             connections={(dr.CONNECTION_BLUETOOTH, device.address)},
         )
 
