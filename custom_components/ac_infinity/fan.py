@@ -77,6 +77,7 @@ class ACInfinityFan(
         self._attr_percentage = percentage
         self.async_write_ha_state()
         await self._device.set_speed(speed)
+        self.coordinator.async_update_listeners()
 
     async def async_turn_on(
         self,
@@ -96,12 +97,14 @@ class ACInfinityFan(
             self._attr_percentage = ranged_value_to_percentage(SPEED_RANGE, speed)
         self.async_write_ha_state()
         await self._device.turn_on(speed)
+        self.coordinator.async_update_listeners()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._attr_is_on = False
         self._attr_percentage = 0
         self.async_write_ha_state()
         await self._device.turn_off()
+        self.coordinator.async_update_listeners()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         if preset_mode == PRESET_AUTO_MODE:

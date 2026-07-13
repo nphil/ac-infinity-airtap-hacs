@@ -9,10 +9,12 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import slugify
+from homeassistant.util.percentage import ranged_value_to_percentage
 
 from .const import DEVICE_MODEL, DOMAIN, FAMILY_E_MODELS, MANUFACTURER
 from .coordinator import ACInfinityDataUpdateCoordinator, ActiveBluetoothCoordinatorEntity
 from .device import ACInfinityDevice
+from .fan import SPEED_RANGE
 from .models import ACInfinityData
 
 
@@ -22,7 +24,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     data: ACInfinityData = hass.data[DOMAIN][entry.entry_id]
-    entities = [TemperatureSensor(data.coordinator, data.device, "Temperature")]
+    entities = [
+        TemperatureSensor(data.coordinator, data.device, "Temperature"),
+        FanSpeedSensor(data.coordinator, data.device, "Fan Speed"),
+    ]
 
     if data.device.state.type not in [6]:  # Airtap does not have humidity
         entities.append(HumiditySensor(data.coordinator, data.device, "Humidity"))
@@ -46,6 +51,7 @@ class ACInfinitySensor(
         super().__init__(coordinator)
         self._device = device
         self._name = name
+        self._attr_name = name
         self._attr_unique_id = f"{self._device.address}_{slugify(name)}"
         self._attr_device_info = DeviceInfo(
             name=device.name,
@@ -76,6 +82,31 @@ class TemperatureSensor(ACInfinitySensor):
     def _update_attrs(self) -> None:
         """Handle updating _attr values."""
         self._attr_native_value = self._device.temperature
+
+
+class FanSpeedSensor(ACInfinitySensor):
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:fan"
+
+    def __init__(
+        self,
+        coordinator: ACInfinityDataUpdateCoordinator,
+        device: ACInfinityDevice,
+        name: str,
+    ) -> None:
+        self._last_speed = 1
+        super().__init__(coordinator, device, name)
+
+    @callback
+    def _update_attrs(self) -> None:
+        """Handle updating _attr values."""
+        fan_speed = self._device.state.fan
+        if fan_speed and fan_speed > 0:
+            self._last_speed = fan_speed
+        self._attr_native_value = ranged_value_to_percentage(
+            SPEED_RANGE, self._last_speed
+        )
 
 
 class HumiditySensor(ACInfinitySensor):
