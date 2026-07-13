@@ -111,6 +111,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
             devices[service_info.address] = f"{device.name} ({service_info.address})"
 
+        if not devices:
+            return self.async_abort(reason="no_devices_found")
+
         data_schema = vol.Schema(
             {
                 vol.Required(CONF_ADDRESS): vol.In(devices),
