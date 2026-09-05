@@ -29,6 +29,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     data: ACInfinityData = hass.data[DOMAIN][entry.entry_id]
+    # Deliberately NO auto-mode humidity threshold numbers: AutoModeConfig
+    # carries high/low humidity fields, but the AIRTAP T-series (type 6) this
+    # fork targets has no humidity sensor (hum is always 0.0), so humidity
+    # knobs would configure a trigger the device can never evaluate. Only
+    # temperature thresholds and speed limits are exposed.
     entities: list[ACInfinityNumber] = [
         PercentageNumber(data.coordinator,
                          data.device,

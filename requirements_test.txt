@@ -1,0 +1,10 @@
+# Test-only dependencies. The vendored ac_infinity_ble library needs the real
+# bleak stack to import (device.py imports bleak / bleak-retry-connector /
+# async_timeout at module level); everything Home Assistant provides at runtime
+# is stubbed in tests/conftest.py instead of installed, so the suite stays fast
+# and runs without a Home Assistant checkout.
+pytest>=8.0
+bleak>=0.21
+bleak-retry-connector>=3.5
+async-timeout>=4.0
+voluptuous>=0.14

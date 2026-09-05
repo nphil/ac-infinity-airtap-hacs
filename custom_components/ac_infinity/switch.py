@@ -25,6 +25,9 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     data: ACInfinityData = hass.data[DOMAIN][entry.entry_id]
+    # Deliberately NO auto-mode humidity trigger switches: the AIRTAP T-series
+    # (type 6) has no humidity sensor (hum is always 0.0), so enabling a
+    # humidity trigger could never fire. See the matching note in number.py.
     entities: list[ACInfinitySwitch] = [
         ACInfinitySwitch(data.coordinator,
                          data.device,

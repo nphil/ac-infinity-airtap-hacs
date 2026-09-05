@@ -1,19 +1,24 @@
+"""Config flow for the AC Infinity AIRTAP BLE integration.
+
+Entry schema is FROZEN at VERSION 1 (CONF_ADDRESS + CONF_SERVICE_DATA):
+live entries must load unchanged across upgrades.
+"""
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-from .ac_infinity_ble.const import MANUFACTURER_ID
 import voluptuous as vol
-
 from homeassistant import config_entries
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
+from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.const import CONF_ADDRESS, CONF_SERVICE_DATA
-from homeassistant.data_entry_flow import FlowResult
 
+from .ac_infinity_ble.const import MANUFACTURER_ID
+from .ac_infinity_ble.protocol import parse_manufacturer_data as _parse_vendored
 from .const import BLEAK_EXCEPTIONS, DOMAIN
 from .device import ACInfinityDevice, DeviceInfoEx
 
@@ -21,11 +26,36 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def parse_manufacturer_data(data: bytes) -> DeviceInfoEx:
-    from .ac_infinity_ble.protocol import parse_manufacturer_data as parse
-    return DeviceInfoEx.create(parse(data))
+    """Parse an AC Infinity manufacturer-data record into DeviceInfoEx."""
+    return DeviceInfoEx.create(_parse_vendored(data))
+
+
+def _try_parse_service_info(
+    service_info: BluetoothServiceInfoBleak,
+) -> DeviceInfoEx | None:
+    """Return parsed device info, or None for foreign/malformed advertisers.
+
+    The manufacturer-ID guard is the device-identity check for this
+    integration; anything without record 2306, or whose record does not parse
+    (truncated frames occur at the fringe of proxy range), must never be
+    offered for setup.
+    """
+    if MANUFACTURER_ID not in service_info.advertisement.manufacturer_data:
+        return None
+    try:
+        return parse_manufacturer_data(
+            service_info.advertisement.manufacturer_data[MANUFACTURER_ID]
+        )
+    except (IndexError, ValueError, UnicodeDecodeError):
+        _LOGGER.debug(
+            "Ignoring unparseable AC Infinity manufacturer data from %s",
+            service_info.address,
+        )
+        return None
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for AC Infinity."""
 
     VERSION = 1
 
@@ -35,22 +65,24 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the bluetooth discovery step."""
+        # raise_on_progress defaults True here: a second discovery for the
+        # same address aborts itself with "already_in_progress" instead of
+        # stacking duplicate flows.
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
-        self._discovery_info = discovery_info
         if MANUFACTURER_ID not in discovery_info.advertisement.manufacturer_data:
             return self.async_abort(reason="no_devices_found")
-        device: DeviceInfoEx = parse_manufacturer_data(
-            discovery_info.advertisement.manufacturer_data[MANUFACTURER_ID]
-        )
+        if (device := _try_parse_service_info(discovery_info)) is None:
+            return self.async_abort(reason="no_devices_found")
+        self._discovery_info = discovery_info
         self.context["title_placeholders"] = {"name": device.name}
         return await self.async_step_user()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the user step to pick discovered device."""
         errors: dict[str, str] = {}
 
@@ -72,7 +104,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected error")
                 errors["base"] = "unknown"
             else:
-                await controller.stop()
                 return self.async_create_entry(
                     title=controller.name,
                     data={
@@ -84,15 +115,28 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         ),
                     },
                 )
+            finally:
+                # Release the GATT connection on every path (including the
+                # error branches, which previously leaked it): connection
+                # slots on the ESPHome proxies are scarce.
+                await controller.stop()
 
         if discovery := self._discovery_info:
             self._discovered_devices[discovery.address] = discovery
         else:
             current_addresses = self._async_current_ids()
+            in_progress_addresses = {
+                flow["context"].get("unique_id")
+                for flow in self._async_in_progress()
+            }
             for discovery in async_discovered_service_info(self.hass):
                 if (
                     discovery.address in current_addresses
+                    or discovery.address in in_progress_addresses
                     or discovery.address in self._discovered_devices
+                    # Collect ONLY AC Infinity advertisers so the picker can
+                    # never offer (or later connect to) a foreign device.
+                    or _try_parse_service_info(discovery) is None
                 ):
                     continue
                 self._discovered_devices[discovery.address] = discovery
@@ -104,11 +148,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         devices = {}
         for service_info in self._discovered_devices.values():
-            if MANUFACTURER_ID not in service_info.advertisement.manufacturer_data:
+            if (device := _try_parse_service_info(service_info)) is None:
                 continue
-            device = parse_manufacturer_data(
-                service_info.advertisement.manufacturer_data[MANUFACTURER_ID]
-            )
             devices[service_info.address] = f"{device.name} ({service_info.address})"
 
         if not devices:

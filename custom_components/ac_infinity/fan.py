@@ -75,6 +75,11 @@ class ACInfinityFan(
             self._last_speed = speed
         self._attr_is_on = speed > 0
         self._attr_percentage = percentage
+        # Setting a manual speed drops the device out of Auto (work_type 3 -> 2/1).
+        # That is correct HA fan semantics, but it must be visible immediately:
+        # without clearing the preset here the UI kept claiming "Auto" while the
+        # fan was already running manually (verified live on real hardware).
+        self._attr_preset_mode = None
         self.async_write_ha_state()
         await self._device.set_speed(speed)
         self.coordinator.async_update_listeners()
@@ -95,6 +100,9 @@ class ACInfinityFan(
         if speed is not None and speed > 0:
             self._last_speed = speed
             self._attr_percentage = ranged_value_to_percentage(SPEED_RANGE, speed)
+        # turn_on drives work_type 2 (manual); clear any stale Auto preset so
+        # the UI never claims Auto while the device runs manually.
+        self._attr_preset_mode = None
         self.async_write_ha_state()
         await self._device.turn_on(speed)
         self.coordinator.async_update_listeners()
@@ -107,10 +115,20 @@ class ACInfinityFan(
         self.coordinator.async_update_listeners()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        if preset_mode == PRESET_AUTO_MODE:
-            await self._device.set_mode_auto()
-        else:
+        """Switch the device to Auto mode."""
+        if preset_mode != PRESET_AUTO_MODE:
             raise ValueError(f"Unsupported preset mode: {preset_mode}")
+        await self._device.set_mode_auto()
+        # Optimistic state, mirroring async_set_percentage. set_mode_auto() has
+        # already flipped state.work_type to AUTO on success, but the next
+        # advertisement/poll can be minutes away over congested ESPHome proxies
+        # (verified live: HA showed the stale preset 8+ minutes after a
+        # successful BLE mode change). Written after the await so a failed BLE
+        # write raises without falsely claiming Auto.
+        self._attr_preset_mode = PRESET_AUTO_MODE
+        self._attr_is_on = True
+        self.async_write_ha_state()
+        self.coordinator.async_update_listeners()
 
     @callback
     def _update_attrs(self) -> None:

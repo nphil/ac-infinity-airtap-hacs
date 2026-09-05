@@ -1,5 +1,4 @@
 {
-  "version": "1.1.1",
   "domain": "ac_infinity",
   "name": "AC Infinity Airtap",
   "bluetooth": [
@@ -9,14 +8,16 @@
     }
   ],
   "codeowners": [
-    "@mtsphere"
+    "@nphil"
   ],
   "config_flow": true,
   "dependencies": [
     "bluetooth_adapters"
   ],
-  "documentation": "https://github.com/mtsphere/ac-infinity-airtap-hacs",
-  "issue_tracker": "https://github.com/mtsphere/ac-infinity-airtap-hacs/issues",
+  "documentation": "https://github.com/nphil/ac-infinity-airtap-hacs",
+  "integration_type": "device",
   "iot_class": "local_push",
-  "requirements": []
+  "issue_tracker": "https://github.com/nphil/ac-infinity-airtap-hacs/issues",
+  "requirements": [],
+  "version": "1.2.0"
 }

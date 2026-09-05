@@ -1,13 +1,22 @@
 {
-    "config": {
-        "abort": {
-            "no_devices_found": "No devices found on the network",
-            "single_instance_allowed": "Already configured. Only a single configuration possible."
-        },
-        "step": {
-            "confirm": {
-                "description": "Do you want to start setup?"
-            }
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "description": "Choose an AC Infinity device to set up",
+        "data": {
+          "address": "Device"
         }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "no_devices_found": "No unconfigured AC Infinity devices found",
+      "already_configured": "Device is already configured",
+      "already_in_progress": "Configuration flow is already in progress"
     }
+  }
 }
