@@ -26,7 +26,7 @@ async def async_setup_entry(
     data: ACInfinityData = hass.data[DOMAIN][entry.entry_id]
     entities = [
         TemperatureSensor(data.coordinator, data.device, "Temperature"),
-        FanSpeedSensor(data.coordinator, data.device, "Fan Speed"),
+        FanSpeedSensor(data.coordinator, data.device, "Fan Speed", "Speed"),
     ]
 
     if data.device.state.type not in [6]:  # Airtap does not have humidity
@@ -47,11 +47,16 @@ class ACInfinitySensor(
         coordinator: ACInfinityDataUpdateCoordinator,
         device: ACInfinityDevice,
         name: str,
+        display_name: str | None = None,
     ) -> None:
         super().__init__(coordinator)
         self._device = device
         self._name = name
-        self._attr_name = name
+        # `name` is the unique_id seed and MUST stay stable - changing it orphans
+        # every existing entity. `display_name` is what the UI shows, so a sensor
+        # can read "<device> Speed" instead of "<device> Fan Speed" on a device
+        # already called "... Vent Fan".
+        self._attr_name = display_name or name
         self._attr_unique_id = f"{self._device.address}_{slugify(name)}"
         self._attr_device_info = DeviceInfo(
             name=device.name,

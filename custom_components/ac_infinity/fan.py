@@ -38,6 +38,10 @@ class ACInfinityFan(
     ActiveBluetoothCoordinatorEntity[ACInfinityDataUpdateCoordinator], FanEntity
 ):
     _attr_has_entity_name = True
+    # The fan IS the device, so it carries no name of its own: with
+    # has_entity_name this makes it inherit the device name verbatim
+    # ("Living Room Vent Fan") instead of appending a second "Fan" to it.
+    _attr_name = None
     _attr_speed_count = int_states_in_range(SPEED_RANGE)
     _attr_supported_features = (
         FanEntityFeature.SET_SPEED
@@ -56,7 +60,8 @@ class ACInfinityFan(
         super().__init__(coordinator)
         self._device = device
         self._last_speed = 1
-        self._attr_name = name
+        # `name` survives only as the unique_id seed (renaming it would orphan
+        # every existing entity); the displayed name comes from the device.
         self._attr_unique_id = f"{self._device.address}_{slugify(name)}"
         self._attr_device_info = DeviceInfo(
             name=device.name,
