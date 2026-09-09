@@ -21,6 +21,13 @@ Concurrency model (WHY it is shaped this way):
   fans share a handful of ESPHome proxy connection slots: needlessly tearing
   down a connection another command is using costs a full reconnect cycle at
   poor RSSI.
+- ``set_hold_connection(True)`` puts the controller in persistent-hold mode:
+  the polite trailing disconnects AND the idle timer are suppressed, so the
+  link (and its proxy slot) survives between commands.  Forced teardowns
+  (error paths, ``stop()``) still work, and a held link that goes away
+  notifies ``register_disconnect_callback`` subscribers so the owner can
+  rebuild it.  Hold is off by default; with it off this module behaves
+  exactly as it did before the option existed.
 
 Connect retries: ``establish_connection`` (bleak-retry-connector) already
 implements bounded, backed-off connect retries, including ESP32-proxy
@@ -102,6 +109,8 @@ class ACInfinityController:
         self._notify_future: asyncio.Future[bytearray] | None = None
         self._sequence = 1
         self._last_advertisement_monotonic: float | None = None
+        self._hold_connection = False
+        self._disconnect_callbacks: list[Callable[[], None]] = []
         if advertisement_data is not None:
             # Being handed an advertisement at construction means one was
             # just seen (or HA's scanner cache holds a recent one); without
@@ -148,6 +157,60 @@ class ACInfinityController:
     def name(self) -> str:
         """Get the name of the device."""
         return self._state.name
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether a usable GATT link is established right now.
+
+        ``_client`` is only published once notifications are subscribed (see
+        ``_ensure_connected``), so a True here means commands can be sent
+        without paying a connect.
+        """
+        return bool(self._client and self._client.is_connected)
+
+    @property
+    def hold_connection(self) -> bool:
+        """Whether the owner wants this link kept open indefinitely."""
+        return self._hold_connection
+
+    def set_hold_connection(self, hold: bool) -> None:
+        """Enable or disable persistent-hold mode.
+
+        While held, ``_execute_disconnect(force=False)`` and the idle
+        disconnect timer are both suppressed, so the link survives between
+        commands and polls.  Turning the hold off does not disconnect: the
+        next polite disconnect (or the idle timer, re-armed on the next
+        connectivity check) releases the slot.
+        """
+        self._hold_connection = hold
+        if hold and self._disconnect_timer:
+            # An idle timer armed before the hold started would otherwise
+            # fire mid-hold and drop the link we were asked to keep.
+            self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+
+    def register_disconnect_callback(
+        self, callback: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Register a callback fired when a live link is lost unexpectedly.
+
+        Fired from the event loop for both flavours of loss: the device (or
+        proxy) dropping us, and a forced teardown of a *live* link by a
+        command's error handler.  Never fired for a disconnect the caller
+        asked for.
+        """
+
+        def unregister_callback() -> None:
+            if callback in self._disconnect_callbacks:
+                self._disconnect_callbacks.remove(callback)
+
+        self._disconnect_callbacks.append(callback)
+        return unregister_callback
+
+    def _fire_disconnect_callbacks(self) -> None:
+        """Tell subscribers a live link went away."""
+        for callback in list(self._disconnect_callbacks):
+            callback()
 
     @property
     def is_on(self) -> bool:
@@ -456,7 +519,14 @@ class ACInfinityController:
         """Reset disconnect timer."""
         if self._disconnect_timer:
             self._disconnect_timer.cancel()
+            self._disconnect_timer = None
         self._expected_disconnect = False
+        if self._hold_connection:
+            # Persistent hold: no idle teardown is armed, on purpose.
+            # Clearing _expected_disconnect above still matters — it is what
+            # makes the next drop count as unexpected and wake the owner's
+            # reconnect supervisor.
+            return
         self._disconnect_timer = self.loop.call_later(
             DISCONNECT_DELAY, self._disconnect
         )
@@ -487,6 +557,7 @@ class ACInfinityController:
             self.name,
             self.rssi,
         )
+        self._fire_disconnect_callbacks()
 
     def _disconnect(self) -> None:
         """Idle-disconnect timer fired."""
@@ -513,13 +584,19 @@ class ACInfinityController:
 
         ``force=False`` (the default, used by the idle timer and the polite
         trailing disconnects of the high-level operations) refuses to tear
-        the connection down while another operation holds the operation
-        lock: the in-flight command owns the connection, and its own
-        trailing disconnect (or the idle timer) will release it.  Error
-        paths and ``stop()`` pass ``force=True`` because they must reset
-        connection state unconditionally.
+        the connection down while a persistent hold is active, or while
+        another operation holds the operation lock: the in-flight command
+        owns the connection, and its own trailing disconnect (or the idle
+        timer) will release it.  Error paths and ``stop()`` pass
+        ``force=True`` because they must reset connection state
+        unconditionally.
         """
         async with self._connect_lock:
+            if not force and self._hold_connection:
+                _LOGGER.debug(
+                    "%s: Skipping disconnect; connection is held", self.name
+                )
+                return
             if not force and self._operation_lock.locked():
                 _LOGGER.debug(
                     "%s: Skipping disconnect; another operation is in progress",
@@ -537,6 +614,15 @@ class ACInfinityController:
             self._client = None
             self._read_char = None
             self._write_char = None
+            # A forced teardown of a still-live link is the command error
+            # path resetting a connection the hold owner asked us to keep;
+            # nothing else reports it (``_disconnected`` sees
+            # _expected_disconnect above and stays quiet), so remember it
+            # and notify once the lock is released.  A client that is
+            # already gone was reported by ``_disconnected`` already.
+            lost_live_link = self._hold_connection and bool(
+                client and client.is_connected
+            )
             if client and client.is_connected:
                 if read_char:
                     try:
@@ -557,6 +643,9 @@ class ACInfinityController:
                     _LOGGER.debug(
                         "%s: Error during disconnect", self.name, exc_info=True
                     )
+        if lost_live_link:
+            # Outside the connect lock: a subscriber reacts by reconnecting.
+            self._fire_disconnect_callbacks()
 
     @retry_bluetooth_connection_error(DEFAULT_ATTEMPTS)
     async def _send_command_locked(self, command: bytes) -> bytes | None:

@@ -22,7 +22,9 @@ Poll failures are logged by core but deliberately do not mark entities
 unavailable — with six fans sharing a handful of ESPHome proxy connection
 slots at RSSI as low as -91, transient GATT failures are routine and coupling
 them to availability would cause constant flapping while advertisement data
-is still perfectly good.
+is still perfectly good.  A live GATT link overrides all of that: a held
+device advertises far less often (observed live), so the advertisement
+tracker can call it unavailable while we are actively talking to it.
 """
 from __future__ import annotations
 
@@ -32,6 +34,7 @@ import logging
 from collections.abc import Callable
 
 from bleak.backends.device import BLEDevice
+from habluetooth import get_manager
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.active_update_coordinator import (
     ActiveBluetoothDataUpdateCoordinator,
@@ -45,6 +48,7 @@ from .ac_infinity_ble.const import MANUFACTURER_ID, CallbackType
 from .ac_infinity_ble.exceptions import CharacteristicMissingError
 from .ac_infinity_ble.models import DeviceInfo
 from .device import ACInfinityDevice
+from .hold import allocation_source_for_address
 
 DEVICE_STARTUP_TIMEOUT = 30
 
@@ -63,6 +67,26 @@ POLL_TIMEOUT = 45
 # headroom. Module-level on purpose: the cap must span all config entries.
 _POLL_SLOTS = 2
 _POLL_SEMAPHORE = asyncio.Semaphore(_POLL_SLOTS)
+
+
+@callback
+def async_holding_scanner_name(hass: HomeAssistant, address: str) -> str | None:
+    """Name of the scanner/proxy currently holding a link to ``address``.
+
+    habluetooth's slot-allocation table is the same source Home Assistant's
+    own ``bluetooth/subscribe_connection_allocations`` websocket serves, so
+    this answers "which proxy is carrying this fan right now" without poking
+    at private scanner state.  None when no scanner reports the address —
+    either nothing is connected, or the connection is via a path that does
+    not report slot allocations.
+    """
+    source = allocation_source_for_address(
+        get_manager().async_current_allocations(), address
+    )
+    if source is None:
+        return None
+    scanner = bluetooth.async_scanner_by_source(hass, source)
+    return scanner.name if scanner is not None else source
 
 
 class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]):
@@ -91,6 +115,19 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         # transition; also armed again by _async_handle_unavailable.
         self._was_unavailable = True
         self._cancel_controller_callback: Callable[[], None] | None = None
+
+    @property
+    def available(self) -> bool:
+        """Advertisement-based availability, widened by a live GATT link.
+
+        A held device advertises much less often than an idle one (observed
+        live), so ``async_track_unavailable`` can declare it gone while the
+        integration is holding an open connection to it and commands are
+        landing in ~200 ms.  A live link is the strongest proof of
+        reachability there is, so it wins; everything else falls through to
+        the base class's advertisement logic unchanged.
+        """
+        return self.controller.is_connected or super().available
 
     @callback
     def _async_start(self) -> None:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+from dataclasses import dataclass
 from enum import Enum, IntFlag, StrEnum
 from types import ModuleType
 
@@ -65,19 +66,53 @@ def slugify(text: str) -> str:
 class _WriteStateRecorder:
     """Mixin for entity stubs: records async_write_ha_state calls.
 
-    Real HA schedules a state-machine update; tests only need to know the
-    entity *asked* for one (that is the optimistic-update contract).
+    Real entities need a hass/platform to write state; the integration's
+    entities are exercised directly in tests, so the recorder stands in for
+    the state machine and lets tests assert that a state write happened.
     """
 
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
+    _write_ha_state_calls = 0
+    _attr_unique_id = None
+    _attr_entity_category = None
+    _attr_translation_key = None
+    _attr_icon = None
+    hass = None
+
+    # Faithful to homeassistant.helpers.entity.Entity: each of these is a
+    # property over the matching _attr_. Note that `name` is deliberately
+    # absent — HA resolves it through hasattr(self, "_attr_name"), which is
+    # the mechanism the Connection sensor relies on to be named by its
+    # translation key.
+    @property
+    def unique_id(self):
+        return self._attr_unique_id
+
+    @property
+    def entity_category(self):
+        return self._attr_entity_category
+
+    @property
+    def translation_key(self):
+        return self._attr_translation_key
+
+    @property
+    def icon(self):
+        return self._attr_icon
+    hass = None
 
     @property
     def write_ha_state_calls(self) -> int:
-        return getattr(self, "_write_ha_state_calls", 0)
+        return self._write_ha_state_calls
 
     def async_write_ha_state(self) -> None:
         self._write_ha_state_calls = self.write_ha_state_calls + 1
+
+    def async_on_remove(self, func) -> None:
+        self._on_remove = getattr(self, "_on_remove", [])
+        self._on_remove.append(func)
+
+    async def async_added_to_hass(self) -> None:
+        """Real HA calls this when the entity is registered."""
 
 
 def install() -> bool:
@@ -86,6 +121,32 @@ def install() -> bool:
         return False
     if importlib.util.find_spec("homeassistant") is not None:
         return False
+
+    # habluetooth: the connection-slot allocation table the Connection
+    # diagnostic sensor reads. Shipped with Home Assistant at runtime, so it
+    # is stubbed under the same "no real HA installed" condition.
+    habluetooth = _module("habluetooth")
+
+    @dataclass
+    class HaBluetoothSlotAllocations:
+        source: str
+        slots: int
+        free: int
+        allocated: list[str]
+
+    class _StubManager:
+        """Reports no allocations and no subscribers; tests inject their own."""
+
+        def async_current_allocations(self, source=None):
+            return []
+
+        def async_register_allocation_callback(self, callback, source=None):
+            return lambda: None
+
+    _stub_manager = _StubManager()
+
+    habluetooth.HaBluetoothSlotAllocations = HaBluetoothSlotAllocations
+    habluetooth.get_manager = lambda: _stub_manager
 
     ha = _module("homeassistant")
 
@@ -198,9 +259,30 @@ def install() -> bool:
         def async_create_entry(self, *, title: str, data):
             return {"type": "create_entry", "title": title, "data": data}
 
+    class OptionsFlow:
+        """Behavioral subset of HA's OptionsFlow.
+
+        ``config_entry`` is injected by HA on the real class; tests assign it
+        directly, which is exactly how the handler consumes it.
+        """
+
+        config_entry = None
+
+        def async_show_form(self, *, step_id: str, data_schema=None, errors=None):
+            return {
+                "type": "form",
+                "step_id": step_id,
+                "data_schema": data_schema,
+                "errors": errors,
+            }
+
+        def async_create_entry(self, *, title: str | None = None, data=None):
+            return {"type": "create_entry", "title": title, "data": data}
+
     config_entries.ConfigEntry = ConfigEntry
     config_entries.ConfigFlowResult = dict  # HA 2024+ alias for FlowResult
     config_entries.ConfigFlow = ConfigFlow
+    config_entries.OptionsFlow = OptionsFlow
 
     # homeassistant.components (+ bluetooth)
     components = _module("homeassistant.components")
@@ -226,12 +308,16 @@ def install() -> bool:
     def async_last_service_info(hass, address, connectable=True):
         return None
 
+    def async_scanner_by_source(hass, source):
+        return None
+
     bluetooth.BluetoothScanningMode = BluetoothScanningMode
     bluetooth.BluetoothChange = BluetoothChange
     bluetooth.BluetoothServiceInfoBleak = BluetoothServiceInfoBleak
     bluetooth.async_discovered_service_info = async_discovered_service_info
     bluetooth.async_ble_device_from_address = async_ble_device_from_address
     bluetooth.async_last_service_info = async_last_service_info
+    bluetooth.async_scanner_by_source = async_scanner_by_source
 
     active_update_coordinator = _module(
         "homeassistant.components.bluetooth.active_update_coordinator"
@@ -256,7 +342,9 @@ def install() -> bool:
             self.hass = hass
             self.logger = logger
             self.address = address
-            self.available = True
+            # Faithful to HA: `available` is a read-only property over
+            # `_available`, which is what lets a subclass widen it.
+            self._available = True
             self.listener_update_count = 0
             # Test bookkeeping: the real base's event handler is the ONLY
             # place that notifies listeners / re-marks availability /
@@ -266,6 +354,10 @@ def install() -> bool:
 
         def __class_getitem__(cls, item):
             return cls
+
+        @property
+        def available(self) -> bool:
+            return self._available
 
         def async_update_listeners(self) -> None:
             self.listener_update_count += 1
@@ -280,7 +372,7 @@ def install() -> bool:
         def _async_handle_unavailable(self, service_info) -> None:
             # Real base flips availability and notifies listeners when no
             # scanner has seen the address for the tracked interval.
-            self.available = False
+            self._available = False
             self.async_update_listeners()
 
         def _async_start(self) -> None:
@@ -339,10 +431,15 @@ def install() -> bool:
 
     class SensorEntity(_WriteStateRecorder):
         _attr_native_value = None
+        _attr_extra_state_attributes = None
 
         @property
         def native_value(self):
             return self._attr_native_value
+
+        @property
+        def extra_state_attributes(self):
+            return self._attr_extra_state_attributes
 
     sensor.SensorDeviceClass = SensorDeviceClass
     sensor.SensorStateClass = SensorStateClass

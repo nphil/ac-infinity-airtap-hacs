@@ -19,6 +19,7 @@ MODULES = [
     "custom_components.ac_infinity.device",
     "custom_components.ac_infinity.diagnostics",
     "custom_components.ac_infinity.fan",
+    "custom_components.ac_infinity.hold",
     "custom_components.ac_infinity.models",
     "custom_components.ac_infinity.number",
     "custom_components.ac_infinity.sensor",

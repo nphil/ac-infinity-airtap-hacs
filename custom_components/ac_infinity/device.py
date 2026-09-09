@@ -10,8 +10,10 @@ register writes here.
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional
 
@@ -22,6 +24,7 @@ from .ac_infinity_ble import ACInfinityController, DeviceInfo
 from .ac_infinity_ble.const import CallbackType
 from .ac_infinity_ble.util import get_bit
 from .const import FAMILY_E_MODELS
+from .hold import HOLD_FAILURE_LOG_EVERY, HoldStatus, backoff_delay
 
 # Work types (mode register values) with working command builders. The
 # protocol enumerates modes 1-12 (see ac_infinity_ble/protocol.py get_mode),
@@ -106,6 +109,139 @@ class ACInfinityDevice(ACInfinityController):
         # the class object and therefore never ran.
         if not isinstance(self._state, DeviceInfoEx):
             self._state = DeviceInfoEx.create(self._state)
+
+        self._hold_status = HoldStatus()
+        self._hold_task: asyncio.Task[None] | None = None
+        self._hold_wake = asyncio.Event()
+        self._cancel_drop_callback: Callable[[], None] | None = None
+        self._hold_scanner_name: Callable[[], str | None] | None = None
+
+    @property
+    def hold_status(self) -> HoldStatus:
+        """Live hold bookkeeping (read by the Connection diagnostic sensor)."""
+        return self._hold_status
+
+    def async_start_hold(
+        self, scanner_name: Callable[[], str | None] | None = None
+    ) -> None:
+        """Start holding the GATT link open until ``async_stop_hold``.
+
+        Idempotent, and non-blocking: the first connect happens in the
+        supervisor task so config-entry setup never waits on a proxy.
+        ``scanner_name`` resolves the proxy currently carrying the link for
+        the log line; it is injected because naming a scanner needs Home
+        Assistant and this module stays HA-free.
+        """
+        if self._hold_task is not None:
+            return
+        self._hold_scanner_name = scanner_name
+        self.set_hold_connection(True)
+        self._hold_status.set_hold(True)
+        self._cancel_drop_callback = self.register_disconnect_callback(
+            self._handle_unexpected_disconnect
+        )
+        self._hold_task = self.loop.create_task(
+            self._hold_supervisor(), name=f"ac_infinity hold {self.address}"
+        )
+
+    async def async_stop_hold(self) -> None:
+        """Stop holding and let the connection be released again.
+
+        Unsubscribes the drop callback FIRST so the teardown that follows
+        (``stop()`` on unload) cannot be mistaken for a lost link, then
+        cancels the supervisor so nothing reconnects behind our back.
+        """
+        if self._cancel_drop_callback is not None:
+            self._cancel_drop_callback()
+            self._cancel_drop_callback = None
+        task = self._hold_task
+        self._hold_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - unload must never fail here
+                _LOGGER.exception(
+                    "%s: Hold supervisor exited with an unexpected error",
+                    self.name,
+                )
+        self.set_hold_connection(False)
+        self._hold_status.set_hold(False)
+        self._hold_status.set_reconnect_attempt(0)
+
+    def _handle_unexpected_disconnect(self) -> None:
+        """Record a lost link and wake the supervisor (event-loop callback)."""
+        self._hold_status.record_drop()
+        self._hold_wake.set()
+
+    async def _hold_supervisor(self) -> None:
+        """Keep the link up for as long as the hold is active.
+
+        Sleeps on an event between drops — no polling, no stacked reconnect
+        tasks.  Reconnects go through the vendored ``_ensure_connected``,
+        hence ``bleak_retry_connector.establish_connection``, so Home
+        Assistant re-scores every proxy that can see the fan on every
+        attempt and the link roams to the best path for free.
+
+        INVARIANT — every path through the loop must hit a real suspension.
+        ``asyncio.Event.wait()`` on an already-set event returns without
+        yielding, so the wake event is cleared IMMEDIATELY before each wait
+        (nothing can run between the two statements: neither is an await
+        point, so no drop can be lost).  Waiting on a stale set — e.g. after
+        a command's own retry rebuilt the link before this task was
+        scheduled — would otherwise spin the event loop at 100%.
+        """
+        attempt = 0
+        first_connect = True
+        while True:
+            if self.is_connected:
+                self._hold_wake.clear()
+                await self._hold_wake.wait()
+                continue
+            attempt += 1
+            self._hold_status.set_reconnect_attempt(attempt)
+            if not first_connect:
+                await asyncio.sleep(backoff_delay(attempt))
+            first_connect = False
+            self._hold_wake.clear()
+            try:
+                await self._ensure_connected()
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - the hold never dies
+                if attempt % HOLD_FAILURE_LOG_EVERY == 0:
+                    _LOGGER.warning(
+                        "%s: Still unable to hold a BLE connection after "
+                        "%s attempts; RSSI: %s; last error: %s",
+                        self.name,
+                        attempt,
+                        self.rssi,
+                        ex,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "%s: Hold reconnect attempt %s failed: %s",
+                        self.name,
+                        attempt,
+                        ex,
+                    )
+                continue
+            attempt = 0
+            self._hold_status.set_reconnect_attempt(0)
+            _LOGGER.info(
+                "%s: Holding BLE connection via %s; RSSI: %s",
+                self.name,
+                self._resolve_scanner_name(),
+                self.rssi,
+            )
+
+    def _resolve_scanner_name(self) -> str:
+        """Name of the proxy carrying the link, for logging only."""
+        if self._hold_scanner_name is None:
+            return "unknown scanner"
+        return self._hold_scanner_name() or "unknown scanner"
 
     def update_ble_device(self, ble_device: BLEDevice) -> None:
         """Refresh only the BLEDevice used for connections.
@@ -206,7 +342,9 @@ class ACInfinityDevice(ACInfinityController):
         finally:
             # Free the proxy connection slot immediately instead of holding
             # it for the vendored DISCONNECT_DELAY; the disconnect is polite
-            # (skipped while another operation holds the lock).
+            # (skipped while another operation holds the lock, and skipped
+            # entirely while a persistent hold is active — see
+            # ACInfinityController._execute_disconnect).
             await self._execute_disconnect()
 
     async def set_mode_auto(self) -> None:

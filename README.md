@@ -27,12 +27,21 @@ provably speaks today. No guessed commands are ever sent to the hardware.
   GATT poll (at most every 30 s per fan, max 2 fans at a time) fills in
   state that advertisements cannot carry (work mode, speed bounds, auto
   thresholds).
+- **Held Bluetooth connection** (option, on by default) — the GATT link to
+  each fan stays open, so a command lands in ~0.2 s instead of paying a 2-6 s
+  proxy connect. It costs one of a proxy's three connection slots per fan and
+  blocks the AC Infinity phone app while held; after a drop it reconnects with
+  backoff, roaming to whichever proxy Home Assistant scores best at that
+  moment. Turn it off per fan in the integration's *Configure* dialog.
 - **Genuine availability** — entities go unavailable when no Bluetooth
   scanner/proxy has seen the fan for the tracked interval, and recover on
-  the first frame seen again.
-- **Diagnostics** — download from the device page: advertisement age, RSSI,
-  which proxy last saw the fan, connection stats, full (address-redacted)
-  device state.
+  the first frame seen again; a fan on a live held connection always counts
+  as available.
+- **Diagnostics** — a **Connection** sensor naming the proxy that currently
+  carries the link (`disconnected` when there is none), with drop counts and
+  the reconnect attempt as attributes; plus a download from the device page:
+  advertisement age, RSSI, which proxy last saw the fan, connection stats,
+  full (address-redacted) device state.
 
 ## Known protocol gaps (not implemented — on purpose)
 
@@ -85,13 +94,19 @@ captures advertisements, GATT connections and raw command/response hex.
 ### ESPHome proxy connection-slot economics
 
 Each ESPHome Bluetooth proxy typically offers **3 concurrent connection
-slots**. This integration is deliberately frugal with them:
+slots**, and how this integration spends them depends on the *Hold Bluetooth
+connection* option:
 
-- connections are opened only for polls and commands, and released
-  immediately afterwards (back-to-back commands reuse the live connection);
-- at most **2 fans poll concurrently across the whole integration**, so a
-  fleet can never exhaust every slot at once and user commands always find
-  headroom.
+- **held (default)** — one slot per fan, permanently, on whichever proxy Home
+  Assistant picked for it. Budget accordingly: seven proxies give 21 slots.
+  The **Connection** sensor shows which proxy holds each fan, so a heal
+  automation can avoid restarting a proxy that other devices are using;
+- **not held** — connections are opened only for polls and commands and
+  released immediately afterwards (back-to-back commands reuse the live
+  connection);
+- either way, at most **2 fans poll concurrently across the whole
+  integration**, so a fleet can never exhaust every slot at once and user
+  commands always find headroom.
 
 If commands still time out, you likely have more BLE devices than slots in
 range of one proxy — add a proxy near the congested area.

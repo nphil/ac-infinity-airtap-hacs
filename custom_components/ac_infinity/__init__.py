@@ -20,8 +20,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .ac_infinity_ble import DeviceInfo
-from .const import DOMAIN
-from .coordinator import ACInfinityDataUpdateCoordinator
+from .const import CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION, DOMAIN
+from .coordinator import ACInfinityDataUpdateCoordinator, async_holding_scanner_name
 from .device import ACInfinityDevice, AutoModeConfig, DeviceInfoEx
 from .models import ACInfinityData
 
@@ -103,9 +103,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.title, device, coordinator
     )
 
+    # Entries created before the option existed carry no options dict, so
+    # the default decides for them; holding is the point of this integration
+    # now (a fresh proxy connect per command costs 1.8-6.4 s).
+    if entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION):
+        device.async_start_hold(
+            lambda: async_holding_scanner_name(hass, address.upper())
+        )
+        # Covers the paths async_unload_entry never sees: a platform forward
+        # below raising leaves the supervisor running otherwise. Idempotent,
+        # so the ordered call in async_unload_entry stays the normal route.
+        entry.async_on_unload(device.async_stop_hold)
+
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the entry so the new hold setting takes effect immediately."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -119,5 +138,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         data: ACInfinityData = hass.data[DOMAIN].pop(entry.entry_id)
+        # Stop the supervisor BEFORE stop(): otherwise the forced teardown
+        # below looks like a lost link and the hold immediately rebuilds the
+        # connection we are trying to release.
+        await data.device.async_stop_hold()
         await data.device.stop()
     return unload_ok

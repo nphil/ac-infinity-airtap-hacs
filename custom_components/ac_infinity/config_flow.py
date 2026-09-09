@@ -1,7 +1,8 @@
-"""Config flow for the AC Infinity AIRTAP BLE integration.
+"""Config and options flow for the AC Infinity AIRTAP BLE integration.
 
 Entry schema is FROZEN at VERSION 1 (CONF_ADDRESS + CONF_SERVICE_DATA):
-live entries must load unchanged across upgrades.
+live entries must load unchanged across upgrades.  Tunables therefore live
+in ``entry.options``, never in ``entry.data``.
 """
 from __future__ import annotations
 
@@ -14,12 +15,18 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
 from homeassistant.const import CONF_ADDRESS, CONF_SERVICE_DATA
+from homeassistant.core import callback
 
 from .ac_infinity_ble.const import MANUFACTURER_ID
 from .ac_infinity_ble.protocol import parse_manufacturer_data as _parse_vendored
-from .const import BLEAK_EXCEPTIONS, DOMAIN
+from .const import (
+    BLEAK_EXCEPTIONS,
+    CONF_HOLD_CONNECTION,
+    DEFAULT_HOLD_CONNECTION,
+    DOMAIN,
+)
 from .device import ACInfinityDevice, DeviceInfoEx
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,6 +65,12 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for AC Infinity."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlowHandler:
+        """Return the options flow for an existing entry."""
+        return OptionsFlowHandler()
 
     def __init__(self) -> None:
         self._discovery_info: BluetoothServiceInfoBleak | None = None
@@ -164,4 +177,35 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=data_schema,
             errors=errors,
+        )
+
+
+class OptionsFlowHandler(config_entries.OptionsFlow):
+    """Per-fan tunables.
+
+    ``self.config_entry`` is supplied by Home Assistant; assigning it here
+    is removed API.  Changing an option triggers the entry update listener
+    in __init__.py, which reloads the entry — that is what starts or stops
+    the hold supervisor.
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_HOLD_CONNECTION,
+                        default=self.config_entry.options.get(
+                            CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION
+                        ),
+                    ): bool,
+                }
+            ),
         )

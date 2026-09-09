@@ -18,5 +18,25 @@
       "already_configured": "Device is already configured",
       "already_in_progress": "Configuration flow is already in progress"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Hold Bluetooth connection",
+        "data": {
+          "hold_connection": "Hold Bluetooth connection"
+        },
+        "data_description": {
+          "hold_connection": "Keep the Bluetooth connection to this fan open permanently, so commands respond in about 0.2 s instead of waiting 2-6 s for a fresh connection. While held, the fan occupies one of the three connection slots on whichever ESPHome Bluetooth proxy carries it, and the AC Infinity phone app cannot connect to the fan. Turn this off to go back to connecting only for each command and poll."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "connection": {
+        "name": "Connection"
+      }
+    }
   }
 }
