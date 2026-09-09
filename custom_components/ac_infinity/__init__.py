@@ -21,7 +21,11 @@ from homeassistant.exceptions import ConfigEntryNotReady
 
 from .ac_infinity_ble import DeviceInfo
 from .const import CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION, DOMAIN
-from .coordinator import ACInfinityDataUpdateCoordinator, async_holding_scanner_name
+from .coordinator import (
+    DEVICE_STARTUP_TIMEOUT,
+    ACInfinityDataUpdateCoordinator,
+    async_holding_scanner_name,
+)
 from .device import ACInfinityDevice, AutoModeConfig, DeviceInfoEx
 from .models import ACInfinityData
 
@@ -93,20 +97,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # callbacks down before the retry.
     entry.async_on_unload(coordinator.async_start())
 
+    # Entries created before the option existed carry no options dict, so
+    # the default decides for them; holding is the point of this integration
+    # now (a fresh proxy connect per command costs 1.8-6.4 s).
+    hold = entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION)
+
     if not await coordinator.async_wait_ready():
-        raise ConfigEntryNotReady(
-            f"{entry.title} ({address}) is not advertising state; "
-            "check ESPHome proxy coverage"
+        if not hold:
+            raise ConfigEntryNotReady(
+                f"{entry.title} ({address}) is not advertising state; "
+                "check ESPHome proxy coverage"
+            )
+        # A held AIRTAP advertises rarely, and right after a restart a proxy
+        # may still own the previous link, so a 30 s window regularly misses
+        # the manufacturer-data frame (all six fans failed setup this way on
+        # 2026-09-09). The connectable path above is proof enough: the hold
+        # supervisor connects and the first GATT poll/notification fills the
+        # state in; entities stay unavailable until then, which is honest.
+        _LOGGER.info(
+            "%s (%s): no parseable advertisement within %ss; holding the link "
+            "and taking state from GATT instead",
+            entry.title,
+            address,
+            DEVICE_STARTUP_TIMEOUT,
         )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = ACInfinityData(
         entry.title, device, coordinator
     )
 
-    # Entries created before the option existed carry no options dict, so
-    # the default decides for them; holding is the point of this integration
-    # now (a fresh proxy connect per command costs 1.8-6.4 s).
-    if entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION):
+    if hold:
         device.async_start_hold(
             lambda: async_holding_scanner_name(hass, address.upper())
         )
