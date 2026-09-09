@@ -90,17 +90,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device = ACInfinityDevice(ble_device, device_info)
     coordinator = ACInfinityDataUpdateCoordinator(hass, _LOGGER, ble_device, device)
 
+    # Entries created before the option existed carry no options dict, so
+    # the default decides for them; holding is the point of this integration
+    # now (a fresh proxy connect per command costs 1.8-6.4 s).
+    hold = entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION)
+
+    if hold:
+        # Before the coordinator starts, on purpose. async_start replays the
+        # cached advertisement immediately, which triggers the first poll;
+        # with the hold not yet switched on that poll ran poll-and-release
+        # semantics - connect, subscribe, read, DISCONNECT - and the supervisor
+        # reconnected 20 s later. Every teardown is a chance for the proxy's
+        # Bluedroid stack to leave a ghost link (measured 2026-09-09), so the
+        # first poll must ride on the link the hold keeps.
+        device.async_start_hold(
+            lambda: async_holding_scanner_name(hass, address.upper())
+        )
+        # Covers the paths async_unload_entry never sees: a platform forward
+        # below raising leaves the supervisor running otherwise. Idempotent,
+        # so the ordered call in async_unload_entry stays the normal route.
+        entry.async_on_unload(device.async_stop_hold)
+
     # Start listening BEFORE waiting: async_start registers the bluetooth
     # callback (which replays the current advertisement immediately when the
     # device is already known) and the unavailability tracker. Registered via
     # async_on_unload first so a ConfigEntryNotReady below still tears the
     # callbacks down before the retry.
     entry.async_on_unload(coordinator.async_start())
-
-    # Entries created before the option existed carry no options dict, so
-    # the default decides for them; holding is the point of this integration
-    # now (a fresh proxy connect per command costs 1.8-6.4 s).
-    hold = entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION)
 
     if not await coordinator.async_wait_ready():
         if not hold:
@@ -125,15 +141,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = ACInfinityData(
         entry.title, device, coordinator
     )
-
-    if hold:
-        device.async_start_hold(
-            lambda: async_holding_scanner_name(hass, address.upper())
-        )
-        # Covers the paths async_unload_entry never sees: a platform forward
-        # below raising leaves the supervisor running otherwise. Idempotent,
-        # so the ordered call in async_unload_entry stays the normal route.
-        entry.async_on_unload(device.async_stop_hold)
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
