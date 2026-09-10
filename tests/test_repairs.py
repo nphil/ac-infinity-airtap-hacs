@@ -784,9 +784,12 @@ class TestRecoveryMenu:
         assert result["description_placeholders"]["last_result"] == ""
         assert result["description_placeholders"]["link"] == "disconnected"
 
-    def test_unloaded_entry_aborts(self):
+    def test_an_entry_that_cannot_be_acted_on_aborts(self):
+        # SETUP_ERROR is an operator decision - a bad address, a failed
+        # migration - and no rung of this ladder applies. SETUP_RETRY
+        # deliberately does not abort; see below.
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
-        entry.state = ConfigEntryState.SETUP_RETRY
+        entry.state = ConfigEntryState.SETUP_ERROR
         hass = FakeHass(entry)
         build(hass, entry, connected=False)
 
@@ -794,6 +797,22 @@ class TestRecoveryMenu:
 
         assert result["type"] == "abort"
         assert result["reason"] == "entry_not_loaded"
+
+    def test_a_fan_still_retrying_setup_gets_the_ladder(self):
+        # The live case from 2026-09-09: the fan was silent when Home
+        # Assistant started, setup raised ConfigEntryNotReady, and the entry
+        # kept retrying. Cutting mains is the only rung that helps a radio
+        # nothing can hear, so the ladder must be reachable here.
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        entry.state = ConfigEntryState.SETUP_RETRY
+        hass = FakeHass(entry)
+
+        result = asyncio.run(self.make_flow(hass).async_step_init())
+
+        assert result["type"] == "menu"
+        assert "power_cycle" in result["menu_options"]
+        assert "reload" in result["menu_options"]
+        assert result["description_placeholders"]["link"] == "disconnected"
 
     def test_issue_for_an_unknown_fan_aborts(self):
         hass = FakeHass()

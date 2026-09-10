@@ -33,6 +33,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import data_entry_flow
+from homeassistant.components import bluetooth
 from homeassistant.components.repairs import RepairsFlow
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import (
@@ -50,6 +51,17 @@ from .const import CONF_LAST_HOLDING_PROXY, CONF_RECOVERY_OUTLET, DOMAIN
 from .coordinator import async_holding_proxy_node, unreachable_issue_id
 from .hold import STATE_CONNECTED, STATE_DISCONNECTED
 from .models import ACInfinityData
+
+#: Entry states this ladder can act on. SETUP_RETRY belongs here as much as
+#: LOADED: a fan that is silent when Home Assistant starts fails setup with
+#: ConfigEntryNotReady and keeps retrying, and that is exactly when the
+#: operator reaches for Fix. Measured 2026-09-09: the Living Room fan sat in
+#: setup_retry with "Could not find AC Infinity device with address
+#: A4:C1:38:44:3D:49" while a 25-second sniff heard the other five fans and
+#: not that one - so the mains rung was the only thing that could help, and
+#: aborting here is what withheld it. Any other state (disabled, a setup
+#: error, a failed unload) needs an operator decision no rung can supply.
+ACTIONABLE_STATES = (ConfigEntryState.LOADED, ConfigEntryState.SETUP_RETRY)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -94,7 +106,7 @@ class BleRecoveryFixFlow(RepairsFlow):
     ) -> data_entry_flow.FlowResult:
         """Offer the ladder, cheapest rung first."""
         entry = self._entry
-        if entry is None or entry.state is not ConfigEntryState.LOADED:
+        if entry is None or entry.state not in ACTIONABLE_STATES:
             return self.async_abort(reason="entry_not_loaded")
 
         menu_options = ["recheck", "reload"]
@@ -166,7 +178,7 @@ class BleRecoveryFixFlow(RepairsFlow):
     ) -> data_entry_flow.FlowResult:
         """Cut and restore mains power to the fan through a switch entity."""
         entry = self._entry
-        if entry is None or entry.state is not ConfigEntryState.LOADED:
+        if entry is None or entry.state not in ACTIONABLE_STATES:
             return self.async_abort(reason="entry_not_loaded")
 
         if user_input is None:
@@ -272,9 +284,45 @@ class BleRecoveryFixFlow(RepairsFlow):
 
     @property
     def _healthy(self) -> bool:
-        """The integration's own verdict on the link — no second opinion."""
+        """The integration's own verdict on the link — no second opinion.
+
+        With no runtime data there is no coordinator to ask, and answering
+        False forever would make every rung fail for an entry stuck in
+        SETUP_RETRY — the state this ladder was extended to serve on
+        2026-09-09, when the Living Room fan sat there with
+        "Could not find AC Infinity device with address ..." while its radio
+        was silent to all seven proxies. The honest substitute is the signal
+        setup itself blocks on: a connectable advertisement. Once the fan is
+        heard again, Home Assistant's own setup retry (or the reload rung)
+        loads the entry and the coordinator takes over the verdict.
+        """
         data = self._runtime_data
-        return data is not None and data.coordinator.link_healthy
+        if data is not None:
+            return data.coordinator.link_healthy
+        return self._advertising
+
+    @property
+    def _advertising(self) -> bool:
+        """Whether Home Assistant currently hears this fan at all.
+
+        Deliberately the same call `async_setup_entry` fails on, so this can
+        never disagree with the condition that raised the repair.
+        """
+        entry = self._entry
+        if entry is None:
+            return False
+        address = entry.data.get(CONF_ADDRESS) or entry.unique_id
+        if not address:
+            return False
+        try:
+            return (
+                bluetooth.async_last_service_info(
+                    self.hass, str(address).upper(), connectable=True
+                )
+                is not None
+            )
+        except Exception:  # noqa: BLE001 - no manager before bluetooth is set up
+            return False
 
     @property
     def _proxy_action(self) -> tuple[str, str] | None:
