@@ -18,13 +18,16 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_SERVICE_DATA, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import issue_registry as ir
 
 from .ac_infinity_ble import DeviceInfo
 from .const import CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION, DOMAIN
 from .coordinator import (
     DEVICE_STARTUP_TIMEOUT,
     ACInfinityDataUpdateCoordinator,
+    ACInfinityLinkWatchdog,
     async_holding_scanner_name,
+    unreachable_issue_id,
 )
 from .device import ACInfinityDevice, AutoModeConfig, DeviceInfoEx
 from .models import ACInfinityData
@@ -138,11 +141,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             DEVICE_STARTUP_TIMEOUT,
         )
 
+    watchdog = ACInfinityLinkWatchdog(hass, entry, coordinator)
+    # Registered before async_start so the 15-minute timer is cancelled even
+    # if a platform forward below raises: an orphaned timer would fire
+    # against a torn-down entry.
+    entry.async_on_unload(watchdog.async_stop)
+
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = ACInfinityData(
-        entry.title, device, coordinator
+        entry.title, device, coordinator, watchdog
     )
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
+    # Started last: the first reconcile may write CONF_LAST_HOLDING_PROXY,
+    # and the update listener below has to be able to find this entry's
+    # runtime data to recognise that write as bookkeeping, not a hold toggle.
+    watchdog.async_start()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -150,7 +164,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry so the new hold setting takes effect immediately."""
+    """Reload the entry when — and only when — the hold setting changed.
+
+    ``entry.options`` also carries bookkeeping the integration writes itself
+    (CONF_LAST_HOLDING_PROXY on every proxy change, CONF_RECOVERY_OUTLET when
+    the repair wizard learns an outlet).  Reloading for those would tear the
+    held link down for no reason, and a fan roaming between two proxies would
+    reload-loop: each reload reconnects, each reconnect writes the new proxy
+    name, which reloads again.  The live hold supervisor is the truth about
+    which setting this entry was actually set up with.
+    """
+    data: ACInfinityData | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    hold = entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION)
+    if data is not None and bool(hold) == data.device.hold_status.hold:
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -165,9 +192,32 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         data: ACInfinityData = hass.data[DOMAIN].pop(entry.entry_id)
+        # Unsubscribe the watchdog FIRST. The teardown below turns the hold
+        # off, which notifies hold-status listeners; the watchdog would then
+        # reconcile with the hold already reported as off, fall back to
+        # advertisement availability, judge a fan that is advertising but
+        # whose GATT link is dead as healthy, and delete a perfectly valid
+        # issue on every reload — the exact orphan/reload class of bug this
+        # watchdog exists to prevent. It is also the only listener left that
+        # could write to an entry whose runtime data is already gone.
+        # (async_on_unload holds this same call for the failed-setup path;
+        # async_stop is idempotent.)
+        data.watchdog.async_stop()
         # Stop the supervisor BEFORE stop(): otherwise the forced teardown
         # below looks like a lost link and the hold immediately rebuilds the
         # connection we are trying to release.
         await data.device.async_stop_hold()
         await data.device.stop()
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Retire this fan's repair issue when its entry is deleted.
+
+    Unload deliberately leaves the issue alone (a reload must not clear a
+    genuine fault), but a removed entry means the fan is gone: nothing would
+    ever reconcile the issue again, and its Fix button could only abort.
+    """
+    ir.async_delete_issue(
+        hass, DOMAIN, unreachable_issue_id(entry.data[CONF_ADDRESS])
+    )

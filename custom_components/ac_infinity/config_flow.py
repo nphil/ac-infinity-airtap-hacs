@@ -194,7 +194,13 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
-            return self.async_create_entry(data=user_input)
+            # MERGE, never replace: options also hold bookkeeping the
+            # integration writes itself (the last holding proxy, the outlet
+            # the repair wizard learned), and this form does not offer those.
+            # Replacing would wipe them on every hold toggle.
+            return self.async_create_entry(
+                data={**self.config_entry.options, **user_input}
+            )
 
         return self.async_show_form(
             step_id="init",

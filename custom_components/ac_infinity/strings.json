@@ -38,5 +38,37 @@
         "name": "Connection"
       }
     }
+  },
+  "issues": {
+    "device_unreachable": {
+      "title": "{name} has had no Bluetooth link for {minutes}+ minutes",
+      "fix_flow": {
+        "abort": {
+          "entry_not_loaded": "This fan's entry is not loaded, so there is nothing here to recover. Check Settings → Devices & services for a setup error on it, then reload the entry and open this repair again."
+        },
+        "step": {
+          "menu": {
+            "title": "Get {name} back online",
+            "description": "{name} has lost its Bluetooth link and the automatic healing has not brought it back. Link right now: **{link}**.\n\nWork down the list — each step performs its action, then waits and re-reads the link before reporting back.\n\n- **Check again** changes nothing at all; use it when a heal script or the hourly re-home may have just fixed the fan.\n- **Reload the integration** rebuilds the connection supervisor from scratch, which makes Home Assistant re-score every proxy that can see the fan and roam to the best one. Cheapest step that actually does something, and the one that fixes a wedged connection most often.\n- **Restart the Bluetooth proxy** reboots the ESPHome node that last carried this fan, clearing a ghost link its Bluetooth stack is still holding. It also drops every other device that proxy is carrying, and the proxy firmware refuses to restart when it booted less than 20 minutes ago — so this step may legitimately do nothing.\n- **Power cycle the fan** cuts its mains supply. Last resort, and the only step that touches the fan itself.\n\n{last_result}",
+            "menu_options": {
+              "recheck": "Check again — change nothing, just re-read the link",
+              "reload": "Reload the integration",
+              "restart_proxy": "Restart the Bluetooth proxy that carries this fan",
+              "power_cycle": "Cut and restore mains power to the fan"
+            }
+          },
+          "power_cycle": {
+            "title": "Power cycle {name}",
+            "description": "This cuts mains power to {name} for {seconds} seconds and switches it back on. It is the last resort: the fan reboots, anything else on the same outlet goes dark with it, and a fan that is mid-command loses it.\n\nPick the switch that feeds this fan. It is remembered on this integration entry, so the next power cycle is one click. Nothing happens until you submit.",
+            "data": {
+              "recovery_outlet": "Switch that powers this fan"
+            },
+            "data_description": {
+              "recovery_outlet": "A switch entity whose outlet feeds this fan's power supply. These fans are usually wired directly, in which case there is nothing to pick here and this step cannot help."
+            }
+          }
+        }
+      }
+    }
   }
 }

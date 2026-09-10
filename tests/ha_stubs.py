@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntFlag, StrEnum
 from types import ModuleType
@@ -166,12 +167,16 @@ def install() -> bool:
     core.callback = callback
     core.HomeAssistant = HomeAssistant
     core.CoreState = CoreState
+    core.CALLBACK_TYPE = Callable[[], None]
 
     # homeassistant.const
     const = _module("homeassistant.const")
     const.PERCENTAGE = "%"
+    const.ATTR_ENTITY_ID = "entity_id"
     const.CONF_ADDRESS = "address"
     const.CONF_SERVICE_DATA = "service_data"
+    const.SERVICE_TURN_OFF = "turn_off"
+    const.SERVICE_TURN_ON = "turn_on"
 
     class UnitOfTemperature(StrEnum):
         CELSIUS = "°C"
@@ -216,6 +221,14 @@ def install() -> bool:
 
     class ConfigEntry:
         pass
+
+    class ConfigEntryState(Enum):
+        """Subset of HA's entry states the repair wizard branches on."""
+
+        NOT_LOADED = "not_loaded"
+        LOADED = "loaded"
+        SETUP_ERROR = "setup_error"
+        SETUP_RETRY = "setup_retry"
 
     class ConfigFlow:
         """Behavioral subset of HA's ConfigFlow used by the guard tests.
@@ -280,6 +293,7 @@ def install() -> bool:
             return {"type": "create_entry", "title": title, "data": data}
 
     config_entries.ConfigEntry = ConfigEntry
+    config_entries.ConfigEntryState = ConfigEntryState
     config_entries.ConfigFlowResult = dict  # HA 2024+ alias for FlowResult
     config_entries.ConfigFlow = ConfigFlow
     config_entries.OptionsFlow = OptionsFlow
@@ -363,10 +377,12 @@ def install() -> bool:
             self.listener_update_count += 1
 
         def _async_handle_bluetooth_event(self, service_info, change) -> None:
-            # Real base: notifies listeners and evaluates needs_poll per
-            # dispatched event. Mirror the listener notification so tests
-            # observe the same externally visible effect.
+            # Real base (bluetooth/passive_update_coordinator.py): marks the
+            # device available again, notifies listeners and evaluates
+            # needs_poll per dispatched event. Mirror the first two so tests
+            # observe the same externally visible effects.
             self.bluetooth_event_super_calls += 1
+            self._available = True
             self.async_update_listeners()
 
         def _async_handle_unavailable(self, service_info) -> None:
@@ -512,6 +528,77 @@ def install() -> bool:
     number.NumberDeviceClass = NumberDeviceClass
     number.NumberMode = NumberMode
 
+    # homeassistant.components.repairs
+    repairs = _module("homeassistant.components.repairs")
+    components.repairs = repairs
+
+    class RepairsFlow:
+        """Behavioral subset of HA's RepairsFlow.
+
+        Same approach as the ConfigFlow stub above: every helper returns a
+        plain dict shaped like the real FlowResult, so the wizard's own
+        branching runs unchanged and tests assert on type/step_id/
+        menu_options rather than on HA internals.  ``hass`` is injected by
+        HA's flow manager on the real class; tests assign it directly.
+        """
+
+        hass = None
+        issue_id = None
+        data = None
+
+        def async_show_form(
+            self,
+            *,
+            step_id: str | None = None,
+            data_schema=None,
+            errors=None,
+            description_placeholders=None,
+            last_step=None,
+        ):
+            return {
+                "type": "form",
+                "step_id": step_id,
+                "data_schema": data_schema,
+                "errors": errors,
+                "description_placeholders": description_placeholders,
+            }
+
+        def async_show_menu(
+            self,
+            *,
+            step_id: str | None = None,
+            menu_options=None,
+            sort: bool = False,
+            description_placeholders=None,
+        ):
+            return {
+                "type": "menu",
+                "step_id": step_id,
+                "menu_options": menu_options,
+                "description_placeholders": description_placeholders,
+            }
+
+        def async_create_entry(
+            self,
+            *,
+            title: str | None = None,
+            data=None,
+            description=None,
+            description_placeholders=None,
+        ):
+            return {"type": "create_entry", "title": title, "data": data}
+
+        def async_abort(
+            self,
+            *,
+            reason: str,
+            description_placeholders=None,
+            translation_domain=None,
+        ):
+            return {"type": "abort", "reason": reason}
+
+    repairs.RepairsFlow = RepairsFlow
+
     # homeassistant.helpers
     helpers = _module("homeassistant.helpers")
 
@@ -554,6 +641,90 @@ def install() -> bool:
             self.async_write_ha_state()
 
     update_coordinator.BaseCoordinatorEntity = BaseCoordinatorEntity
+
+    # homeassistant.helpers.issue_registry — behavioral, not a no-op: the
+    # repair issue's presence/absence IS what the watchdog tests assert on,
+    # so the stub keeps a real in-memory registry with HA's own semantics
+    # (create replaces, delete of a missing issue is not an error) under
+    # HA's own hass.data key.
+    issue_registry = _module("homeassistant.helpers.issue_registry")
+    helpers.issue_registry = issue_registry
+
+    class IssueSeverity(StrEnum):
+        CRITICAL = "critical"
+        ERROR = "error"
+        WARNING = "warning"
+
+    class IssueRegistry:
+        def __init__(self) -> None:
+            self.issues: dict[tuple[str, str], dict] = {}
+
+        def async_get_issue(self, domain: str, issue_id: str):
+            return self.issues.get((domain, issue_id))
+
+    def issue_registry_async_get(hass) -> IssueRegistry:
+        return hass.data.setdefault("issue_registry", IssueRegistry())
+
+    def async_create_issue(hass, domain, issue_id, **kwargs) -> None:
+        issue_registry_async_get(hass).issues[(domain, issue_id)] = {
+            "domain": domain,
+            "issue_id": issue_id,
+            **kwargs,
+        }
+
+    def async_delete_issue(hass, domain, issue_id) -> None:
+        issue_registry_async_get(hass).issues.pop((domain, issue_id), None)
+
+    issue_registry.IssueSeverity = IssueSeverity
+    issue_registry.IssueRegistry = IssueRegistry
+    issue_registry.async_get = issue_registry_async_get
+    issue_registry.async_create_issue = async_create_issue
+    issue_registry.async_delete_issue = async_delete_issue
+
+    # homeassistant.helpers.event
+    event = _module("homeassistant.helpers.event")
+    helpers.event = event
+
+    def async_call_later(hass, delay, action):
+        """Record the timer instead of arming a real one.
+
+        Tests fire the recorded action to simulate the delay elapsing, which
+        is the only way to exercise a 15-minute threshold without waiting;
+        cancelling must actually remove it, because "the timer was cancelled
+        on reconnect" is part of the contract.
+        """
+        timers = getattr(hass, "pending_timers", None)
+        if timers is None:
+            timers = []
+            hass.pending_timers = timers
+        timer = (delay, action)
+        timers.append(timer)
+
+        def cancel() -> None:
+            if timer in timers:
+                timers.remove(timer)
+
+        return cancel
+
+    event.async_call_later = async_call_later
+
+    # homeassistant.helpers.selector
+    selector = _module("homeassistant.helpers.selector")
+    helpers.selector = selector
+
+    class EntitySelectorConfig(dict):
+        """HA models this as a TypedDict; a dict subclass is faithful enough."""
+
+    class EntitySelector:
+        def __init__(self, config=None) -> None:
+            self.config = config or {}
+
+        def __call__(self, data):
+            # Real selectors are voluptuous-callable validators.
+            return data
+
+    selector.EntitySelector = EntitySelector
+    selector.EntitySelectorConfig = EntitySelectorConfig
 
     # homeassistant.util (+ percentage)
     util = _module("homeassistant.util")

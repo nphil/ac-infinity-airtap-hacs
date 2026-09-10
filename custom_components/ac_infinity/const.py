@@ -16,6 +16,19 @@ BLEAK_EXCEPTIONS = (AttributeError, BleakError, TimeoutError)
 CONF_HOLD_CONNECTION = "hold_connection"
 DEFAULT_HOLD_CONNECTION = True
 
+# Per-entry bookkeeping options. Written by the integration itself, never
+# offered in the options flow: the options flow must therefore merge rather
+# than replace, or one hold toggle would wipe both.
+#
+# CONF_LAST_HOLDING_PROXY: the ESPHome proxy that last carried this fan's
+# link. While the fan is unreachable NOTHING holds it, so the recovery
+# wizard cannot discover a proxy at Fix time — which is exactly when it
+# needs to offer restarting one.
+# CONF_RECOVERY_OUTLET: the switch the operator last used to power-cycle
+# this fan, remembered so the last resort is one click next time.
+CONF_LAST_HOLDING_PROXY = "last_holding_proxy"
+CONF_RECOVERY_OUTLET = "recovery_outlet"
+
 DEVICE_MODEL = {1: "Controller 67",
                 6: "Airtap Series",
                 7: "Controller 69",

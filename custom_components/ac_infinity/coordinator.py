@@ -32,9 +32,10 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
+from datetime import datetime, timedelta
 
 from bleak.backends.device import BLEDevice
-from habluetooth import get_manager
+from habluetooth import HaBluetoothSlotAllocations, get_manager
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.active_update_coordinator import (
     ActiveBluetoothDataUpdateCoordinator,
@@ -42,11 +43,16 @@ from homeassistant.components.bluetooth.active_update_coordinator import (
 from homeassistant.components.bluetooth.passive_update_coordinator import (
     PassiveBluetoothCoordinatorEntity,
 )
-from homeassistant.core import CoreState, HomeAssistant, callback
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_ADDRESS
+from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.event import async_call_later
 
 from .ac_infinity_ble.const import MANUFACTURER_ID, CallbackType
 from .ac_infinity_ble.exceptions import CharacteristicMissingError
 from .ac_infinity_ble.models import DeviceInfo
+from .const import CONF_LAST_HOLDING_PROXY, DOMAIN
 from .device import ACInfinityDevice
 from .hold import allocation_source_for_address
 
@@ -68,6 +74,14 @@ POLL_TIMEOUT = 45
 _POLL_SLOTS = 2
 _POLL_SEMAPHORE = asyncio.Semaphore(_POLL_SLOTS)
 
+# How long this entry's own BLE link must be continuously down before the
+# device_unreachable repair is raised. Deliberately long: the household heal
+# machinery (script.ble_heal_device, plus the hourly re-home) gets several
+# passes inside this window, and the hold's own reconnect ladder settles at
+# one attempt per minute — so 15 minutes of nothing means the automatic
+# recovery has genuinely given up, not that a proxy is mid-roam.
+UNREACHABLE_AFTER = timedelta(minutes=15)
+
 
 @callback
 def async_holding_scanner_name(hass: HomeAssistant, address: str) -> str | None:
@@ -87,6 +101,16 @@ def async_holding_scanner_name(hass: HomeAssistant, address: str) -> str | None:
         return None
     scanner = bluetooth.async_scanner_by_source(hass, source)
     return scanner.name if scanner is not None else source
+
+
+def unreachable_issue_id(address: str) -> str:
+    """Repair-issue id for the fan at ``address`` being unreachable.
+
+    One issue per config entry, keyed off the address rather than the entry
+    id so the six fans never share one and the id stays stable across an
+    entry being removed and re-added.
+    """
+    return f"{address.upper().replace(':', '')}_unreachable"
 
 
 class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]):
@@ -115,6 +139,7 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         # transition; also armed again by _async_handle_unavailable.
         self._was_unavailable = True
         self._cancel_controller_callback: Callable[[], None] | None = None
+        self._health_listener: CALLBACK_TYPE | None = None
 
     @property
     def available(self) -> bool:
@@ -128,6 +153,46 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         the base class's advertisement logic unchanged.
         """
         return self.controller.is_connected or super().available
+
+    @property
+    def link_healthy(self) -> bool:
+        """Whether this entry's own path to the fan is working right now.
+
+        The single source of truth for "is this fan reachable" — used by the
+        unreachable watchdog and by the Repairs recovery wizard, so both
+        judge the link exactly as the integration itself does.
+
+        With the hold on (the default) the honest measure is the GATT link:
+        keeping it up is the supervisor's entire job, so a link that is down
+        is a real fault no matter how well the fan is still advertising.
+        With the hold off there is no persistent link to measure and
+        ``available`` — some scanner has seen the fan recently — is the only
+        notion of reachability the integration has.
+        """
+        if self.controller.hold_status.hold:
+            return self.controller.is_connected
+        return self.available
+
+    @callback
+    def async_set_health_listener(self, listener: CALLBACK_TYPE | None) -> None:
+        """Register (or clear) a callback for advertisement-driven health flips.
+
+        The unreachable watchdog otherwise learns about the link from the
+        hold supervisor and from habluetooth's allocation table, and both are
+        silent when the hold is turned off for an entry: no supervisor runs,
+        and a fan that simply stops advertising changes nobody's connection
+        slots.  In exactly the configuration where ``link_healthy`` IS
+        advertisement availability, the watchdog would then reconcile once at
+        setup and never again — a fan that died afterwards would never raise
+        the repair, and one that recovered would keep it forever.  So the two
+        handlers that own those transitions report them here.
+        """
+        self._health_listener = listener
+
+    @callback
+    def _async_notify_health(self) -> None:
+        if self._health_listener is not None:
+            self._health_listener()
 
     @callback
     def _async_start(self) -> None:
@@ -251,7 +316,8 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         # Keep the controller connecting via the freshest BLEDevice/proxy path
         # even when this particular frame carries no parseable payload.
         self.controller.update_ble_device(service_info.device)
-        if self._was_unavailable:
+        was_unavailable = self._was_unavailable
+        if was_unavailable:
             self._was_unavailable = False
             self.logger.info(
                 "%s (%s) is online", service_info.name, service_info.address
@@ -283,6 +349,11 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         # ALWAYS runs: fires entity listeners (base passive coordinator does
         # this unconditionally per dispatched event) and schedules GATT polls.
         super()._async_handle_bluetooth_event(service_info, change)
+        if was_unavailable:
+            # A health transition, reported only on the flip (this runs for
+            # every frame of every fan) and only after super(), which is what
+            # marks the device available again.
+            self._async_notify_health()
 
     @callback
     def _async_handle_unavailable(
@@ -302,6 +373,7 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
             service_info.name,
             service_info.address,
         )
+        self._async_notify_health()
 
     async def async_wait_ready(self) -> bool:
         """Wait for the first parseable advertisement after start."""
@@ -310,6 +382,160 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
                 await self._device_ready.wait()
                 return True
         return False
+
+
+class ACInfinityLinkWatchdog:
+    """Keeps the ``device_unreachable`` repair in sync with one fan's link.
+
+    One instance per config entry: six fans share this code, so the issue id,
+    the 15-minute timer and the remembered proxy all belong to the entry, not
+    to the module.
+
+    THE RULE THIS CLASS EXISTS TO ENFORCE (learned the hard way in the
+    sibling fluvalble integration on 2026-09-09: an issue raised at 12:22 was
+    still open 13 hours after its condition cleared at 13:00, because the
+    delete was gated on an in-memory "was previously bad" flag that the 12:38
+    entry reload reset to None): deletion is NEVER gated on remembered
+    state.  Reconciliation compares the issue against the link's ACTUAL
+    state, runs on every link transition and once at setup, and both
+    ``async_create_issue`` and ``async_delete_issue`` are idempotent — which
+    is precisely what makes an unconditional reconcile the only form that
+    survives a reload.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        coordinator: ACInfinityDataUpdateCoordinator,
+    ) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.coordinator = coordinator
+        self.address: str = entry.data[CONF_ADDRESS].upper()
+        self.issue_id = unreachable_issue_id(self.address)
+        self._unsubscribes: list[CALLBACK_TYPE] = []
+        self._cancel_deadline: CALLBACK_TYPE | None = None
+        self._deadline_passed = False
+
+    @callback
+    def async_start(self) -> None:
+        """Subscribe to every source of link changes and reconcile once, now.
+
+        Two of the three are the pair the Connection sensor uses:
+        habluetooth's allocation table reports connect/disconnect/roam across
+        every proxy, and the hold status reports the drops and the reconnect
+        ladder no bluetooth event carries.  Both are silent for an entry with
+        the hold turned off, hence the coordinator's health listener as well —
+        see async_set_health_listener.
+        """
+        self._unsubscribes.append(
+            get_manager().async_register_allocation_callback(
+                self._async_allocations_changed, None
+            )
+        )
+        self._unsubscribes.append(
+            self.coordinator.controller.hold_status.add_listener(
+                self.async_link_changed
+            )
+        )
+        self.coordinator.async_set_health_listener(self.async_link_changed)
+        self._unsubscribes.append(
+            lambda: self.coordinator.async_set_health_listener(None)
+        )
+        # Reality, not remembered state: an issue that outlived a reload means
+        # the deadline already passed once, so the countdown must not restart
+        # from zero (which would let a genuinely dead fan's issue be re-armed
+        # forever by a reload loop). A Home Assistant restart drops the issue
+        # (is_persistent=False), and then a fresh countdown is the honest
+        # answer, because nothing knows how long the link was down.
+        self._deadline_passed = (
+            ir.async_get(self.hass).async_get_issue(DOMAIN, self.issue_id) is not None
+        )
+        self.async_link_changed()
+
+    @callback
+    def async_stop(self) -> None:
+        """Unsubscribe and cancel the pending deadline (unload/reload)."""
+        while self._unsubscribes:
+            self._unsubscribes.pop()()
+        self._async_cancel_deadline()
+
+    @callback
+    def async_link_changed(self) -> None:
+        """Reconcile the repair issue against the link's actual state.
+
+        Unconditional in both directions on purpose — see the class docstring.
+        """
+        if self.coordinator.link_healthy:
+            self._async_cancel_deadline()
+            self._deadline_passed = False
+            self._async_remember_proxy()
+            ir.async_delete_issue(self.hass, DOMAIN, self.issue_id)
+            return
+        if self._deadline_passed:
+            self._async_create_issue()
+            return
+        if self._cancel_deadline is None:
+            self._cancel_deadline = async_call_later(
+                self.hass, UNREACHABLE_AFTER, self._async_deadline_reached
+            )
+
+    @callback
+    def _async_deadline_reached(self, _now: datetime) -> None:
+        """Handle the link having been down for the whole threshold."""
+        self._cancel_deadline = None
+        self._deadline_passed = True
+        self.async_link_changed()
+
+    @callback
+    def _async_cancel_deadline(self) -> None:
+        if self._cancel_deadline is not None:
+            self._cancel_deadline()
+            self._cancel_deadline = None
+
+    @callback
+    def _async_create_issue(self) -> None:
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            self.issue_id,
+            is_fixable=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="device_unreachable",
+            translation_placeholders={
+                "name": self.entry.title,
+                "minutes": str(int(UNREACHABLE_AFTER.total_seconds() // 60)),
+            },
+        )
+
+    @callback
+    def _async_allocations_changed(
+        self, allocations: HaBluetoothSlotAllocations
+    ) -> None:
+        """Handle a proxy reporting a change to its connection slots."""
+        self.async_link_changed()
+
+    @callback
+    def _async_remember_proxy(self) -> None:
+        """Write down the proxy currently carrying the link.
+
+        Only while the link is up can this be answered at all: an unreachable
+        fan is held by nobody, so the recovery wizard has no way to discover
+        a proxy at Fix time.  Written only when it changed — every write is a
+        config-entry update, and a fan that roams between two proxies would
+        otherwise churn storage (and fire the entry update listener) on every
+        reconnect.
+        """
+        scanner = async_holding_scanner_name(self.hass, self.address)
+        if scanner is None:
+            return
+        if self.entry.options.get(CONF_LAST_HOLDING_PROXY) == scanner:
+            return
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            options={**self.entry.options, CONF_LAST_HOLDING_PROXY: scanner},
+        )
 
 
 class ActiveBluetoothCoordinatorEntity[

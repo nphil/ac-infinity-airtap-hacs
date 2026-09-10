@@ -42,6 +42,15 @@ provably speaks today. No guessed commands are ever sent to the hardware.
   the reconnect attempt as attributes; plus a download from the device page:
   advertisement age, RSSI, which proxy last saw the fan, connection stats,
   full (address-redacted) device state.
+- **Recovery repair** — when a fan's own Bluetooth link has been down for 15
+  minutes straight, a repair appears under *Settings → System → Repairs*
+  whose Fix button walks up an escalation ladder: check again, reload the
+  entry, restart the ESPHome proxy that last carried the fan (offered only
+  when that proxy exposes a `restart_proxy` action), and finally power-cycle
+  the fan through a switch entity you pick. Each step waits and re-reads the
+  link before reporting back, and the repair clears itself the moment the
+  link is up again — including after a reload, which is when a naive
+  implementation leaves the issue orphaned on screen.
 
 ## Known protocol gaps (not implemented — on purpose)
 

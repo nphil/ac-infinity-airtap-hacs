@@ -1,0 +1,647 @@
+"""Behaviour tests for the unreachable watchdog and the recovery wizard.
+
+Two failures are pinned here, in the order they bite.
+
+THE ORPHAN BUG (observed in the sibling fluvalble integration on 2026-09-09:
+an issue raised at 12:22 was still open 13 hours after its condition cleared
+at 13:00, because the delete was gated on an in-memory flag that the 12:38
+entry reload reset).  Reconciliation must therefore compare the issue against
+the link's actual state, unconditionally, and must run at setup — not only on
+a transition it may have missed while unloaded.
+
+THE THRESHOLD.  Six fans share this code, so the issue, the 15-minute timer
+and the remembered proxy all belong to one config entry; an unreachable fan
+must not raise five extra repairs.
+
+The real coordinator, device, watchdog and fix flow run.  Home Assistant is
+the stub layer (tests/ha_stubs.py), whose issue registry is a real in-memory
+registry and whose ``async_call_later`` records the timer so a 15-minute
+threshold can be reached without waiting for it.
+"""
+
+import asyncio
+import contextlib
+import logging
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
+import custom_components.ac_infinity.coordinator as coordinator_module
+import custom_components.ac_infinity.repairs as repairs_module
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
+
+from custom_components.ac_infinity.config_flow import OptionsFlowHandler
+from custom_components.ac_infinity.const import (
+    CONF_HOLD_CONNECTION,
+    CONF_LAST_HOLDING_PROXY,
+    CONF_RECOVERY_OUTLET,
+    DOMAIN,
+)
+from custom_components.ac_infinity.coordinator import (
+    UNREACHABLE_AFTER,
+    ACInfinityDataUpdateCoordinator,
+    ACInfinityLinkWatchdog,
+    unreachable_issue_id,
+)
+from custom_components.ac_infinity.device import ACInfinityDevice, DeviceInfoEx
+from custom_components.ac_infinity.models import ACInfinityData
+from custom_components.ac_infinity.repairs import async_create_fix_flow
+
+ADDRESS = "AA:BB:CC:DD:EE:FF"
+OTHER_ADDRESS = "11:22:33:44:55:66"
+ISSUE_ID = unreachable_issue_id(ADDRESS)
+PROXY = "plant-room-bluetooth-proxy"
+PROXY_ACTION = "plant_room_bluetooth_proxy_restart_proxy"
+PROXY_SOURCE = "F0:F0:F0:F0:F0:F0"
+
+
+class FakeClient:
+    """A live GATT link, as far as ``controller.is_connected`` can tell."""
+
+    is_connected = True
+
+
+class FakeEntry:
+    def __init__(self, entry_id: str, title: str, address: str, **options) -> None:
+        self.entry_id = entry_id
+        self.title = title
+        self.data = {"address": address}
+        self.options = dict(options)
+        self.state = ConfigEntryState.LOADED
+
+
+class FakeConfigEntries:
+    def __init__(self, *entries: FakeEntry) -> None:
+        self._entries = list(entries)
+        self.reloads: list[str] = []
+        self.option_writes: list[tuple[str, dict]] = []
+
+    def async_entries(self, domain=None):
+        return list(self._entries)
+
+    def async_get_entry(self, entry_id):
+        return next((e for e in self._entries if e.entry_id == entry_id), None)
+
+    def async_update_entry(self, entry, *, options=None, **kwargs):
+        if options is not None:
+            entry.options = dict(options)
+            self.option_writes.append((entry.entry_id, entry.options))
+
+    async def async_reload(self, entry_id):
+        self.reloads.append(entry_id)
+
+
+class FakeServices:
+    """Faithful to the two ServiceRegistry members the wizard uses."""
+
+    def __init__(self, services: dict | None = None) -> None:
+        self._services = services or {}
+        self.calls: list[tuple[str, str, dict | None]] = []
+        # (domain, service) pairs that raise once, to exercise error paths.
+        self.fail: set[tuple[str, str]] = set()
+
+    def has_service(self, domain, service):
+        return service in self._services.get(domain, {})
+
+    async def async_call(self, domain, service, data=None, blocking=False):
+        self.calls.append((domain, service, data))
+        if (domain, service) in self.fail:
+            self.fail.discard((domain, service))
+            raise HomeAssistantError(f"{domain}.{service} unavailable")
+
+
+class FakeHass:
+    def __init__(self, *entries: FakeEntry, services: dict | None = None) -> None:
+        self.data = {}
+        self.config_entries = FakeConfigEntries(*entries)
+        self.services = FakeServices(services)
+
+
+def fire_timers(hass: FakeHass) -> int:
+    """Run every recorded ``async_call_later`` callback; returns how many."""
+    timers = getattr(hass, "pending_timers", [])
+    due = list(timers)
+    timers.clear()
+    for _delay, action in due:
+        action(datetime.now(timezone.utc))
+    return len(due)
+
+
+def pending_delays(hass: FakeHass) -> list:
+    return [delay for delay, _action in getattr(hass, "pending_timers", [])]
+
+
+def build(hass: FakeHass, entry: FakeEntry, *, connected: bool, hold: bool = True):
+    """Wire up a real device/coordinator/watchdog trio for ``entry``.
+
+    ``hold`` mirrors the CONF_HOLD_CONNECTION option: on (as it is on all six
+    live fans) ``link_healthy`` is the GATT link itself, off it is
+    advertisement availability.
+    """
+
+    async def _build():
+        ble = SimpleNamespace(address=entry.data["address"], name="D-A6B2C")
+        device = ACInfinityDevice(
+            ble, state=DeviceInfoEx(type=6, name="D-A6B2C", version=1)
+        )
+        device.hold_status.set_hold(hold)
+        if connected:
+            device._client = FakeClient()
+        coordinator = ACInfinityDataUpdateCoordinator(
+            hass, logging.getLogger("test"), ble, device
+        )
+        watchdog = ACInfinityLinkWatchdog(hass, entry, coordinator)
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = ACInfinityData(
+            entry.title, device, coordinator, watchdog
+        )
+        return device, coordinator, watchdog
+
+    return asyncio.run(_build())
+
+
+def reconnect(device: ACInfinityDevice) -> None:
+    """Reproduce what the hold supervisor does on a successful reconnect.
+
+    Both writes matter: the supervisor announces the attempt before calling
+    _ensure_connected and clears it after, and HoldStatus only notifies on a
+    change — so 1 then 0 is the notification pair a real reconnect produces.
+    """
+    device.hold_status.set_reconnect_attempt(1)
+    device._client = FakeClient()
+    device.hold_status.set_reconnect_attempt(0)
+
+
+def drop(device: ACInfinityDevice) -> None:
+    """Reproduce a lost link: no client, and the supervisor notified."""
+    device._client = None
+    device.hold_status.record_drop()
+
+
+def issues(hass: FakeHass) -> dict:
+    return ir.async_get(hass).issues
+
+
+class TestSetupReconciliation:
+    """async_setup_entry calls async_start; it must settle the issue then."""
+
+    def test_orphaned_issue_is_deleted_at_setup(self):
+        """THE orphan bug: an issue whose condition has cleared must go, and
+        nothing about "did this entry see the transition" may gate that —
+        the entry that raised it is gone after a reload."""
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            ISSUE_ID,
+            is_fixable=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="device_unreachable",
+        )
+        _, _, watchdog = build(hass, entry, connected=True)
+
+        watchdog.async_start()
+
+        assert (DOMAIN, ISSUE_ID) not in issues(hass)
+
+    def test_issue_survives_a_reload_while_the_link_is_still_down(self):
+        """The other half of the rule: reconciliation is unconditional, not
+        blind. A still-broken fan keeps its repair across the reload, and the
+        15-minute countdown does not start over (which would let a reload
+        loop hide a dead fan forever)."""
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            ISSUE_ID,
+            is_fixable=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="device_unreachable",
+        )
+        _, _, watchdog = build(hass, entry, connected=False)
+
+        watchdog.async_start()
+
+        assert (DOMAIN, ISSUE_ID) in issues(hass)
+        assert pending_delays(hass) == []
+
+
+class TestUnreachableThreshold:
+    def test_nothing_is_raised_before_the_threshold(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, _, watchdog = build(hass, entry, connected=False)
+
+        watchdog.async_start()
+
+        assert issues(hass) == {}
+        assert pending_delays(hass) == [UNREACHABLE_AFTER]
+
+    def test_issue_is_raised_once_the_threshold_passes(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, _, watchdog = build(hass, entry, connected=False)
+        watchdog.async_start()
+
+        assert fire_timers(hass) == 1
+
+        issue = issues(hass)[(DOMAIN, ISSUE_ID)]
+        assert issue["is_fixable"] is True
+        assert issue["severity"] is ir.IssueSeverity.WARNING
+        assert issue["translation_key"] == "device_unreachable"
+        assert issue["translation_placeholders"]["name"] == "Tent Vent Fan"
+
+    def test_reconnect_deletes_the_issue(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        device, _, watchdog = build(hass, entry, connected=False)
+        watchdog.async_start()
+        fire_timers(hass)
+        assert (DOMAIN, ISSUE_ID) in issues(hass)
+
+        reconnect(device)
+
+        assert issues(hass) == {}
+
+    def test_reconnect_before_the_threshold_cancels_the_timer(self):
+        """Otherwise the fan is marked unreachable 15 minutes after a blip it
+        already recovered from."""
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        device, _, watchdog = build(hass, entry, connected=False)
+        watchdog.async_start()
+        assert pending_delays(hass) == [UNREACHABLE_AFTER]
+
+        reconnect(device)
+
+        assert pending_delays(hass) == []
+        assert issues(hass) == {}
+
+    def test_a_second_drop_arms_the_timer_again(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        device, _, watchdog = build(hass, entry, connected=True)
+        watchdog.async_start()
+
+        drop(device)
+
+        assert pending_delays(hass) == [UNREACHABLE_AFTER]
+        assert issues(hass) == {}
+        assert fire_timers(hass) == 1
+        assert (DOMAIN, ISSUE_ID) in issues(hass)
+
+    def test_unload_cancels_the_timer(self):
+        """An orphaned timer would fire against a torn-down entry."""
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, _, watchdog = build(hass, entry, connected=False)
+        watchdog.async_start()
+
+        watchdog.async_stop()
+
+        assert pending_delays(hass) == []
+        # And the link going up/down afterwards no longer touches issues.
+        assert fire_timers(hass) == 0
+        assert issues(hass) == {}
+
+
+class TestHoldDisabledEntry:
+    """With the hold off there is no supervisor and no proxy allocation, so
+    the ONLY thing that moves health is advertisement visibility. Without the
+    coordinator's health listener the watchdog would reconcile once at setup
+    and then never again for these entries."""
+
+    @staticmethod
+    def frame():
+        return SimpleNamespace(
+            name="D-A6B2C",
+            address=ADDRESS,
+            device=SimpleNamespace(address=ADDRESS, name="D-A6B2C"),
+            advertisement=SimpleNamespace(manufacturer_data={}),
+        )
+
+    def test_going_unavailable_then_the_threshold_raises_the_issue(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, coordinator, watchdog = build(hass, entry, connected=False, hold=False)
+        watchdog.async_start()
+        assert issues(hass) == {}
+
+        coordinator._async_handle_unavailable(self.frame())
+
+        assert pending_delays(hass) == [UNREACHABLE_AFTER]
+        assert fire_timers(hass) == 1
+        assert (DOMAIN, ISSUE_ID) in issues(hass)
+
+    def test_the_fan_being_seen_again_clears_the_issue(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, coordinator, watchdog = build(hass, entry, connected=False, hold=False)
+        watchdog.async_start()
+        coordinator._async_handle_unavailable(self.frame())
+        fire_timers(hass)
+        assert (DOMAIN, ISSUE_ID) in issues(hass)
+
+        coordinator._async_handle_bluetooth_event(self.frame(), object())
+
+        assert issues(hass) == {}
+
+    def test_the_listener_is_dropped_on_unload(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, coordinator, watchdog = build(hass, entry, connected=False, hold=False)
+        watchdog.async_start()
+        watchdog.async_stop()
+
+        coordinator._async_handle_unavailable(self.frame())
+
+        assert pending_delays(hass) == []
+
+
+class TestPerEntryIsolation:
+    def test_only_the_unreachable_fans_issue_is_raised(self):
+        """Six entries share this code; one dead fan must raise exactly one
+        repair, keyed to its own address."""
+        down = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        up = FakeEntry("e2", "Closet Vent Fan", OTHER_ADDRESS)
+        hass = FakeHass(down, up)
+        _, _, down_watchdog = build(hass, down, connected=False)
+        _, _, up_watchdog = build(hass, up, connected=True)
+
+        down_watchdog.async_start()
+        up_watchdog.async_start()
+        fire_timers(hass)
+
+        assert set(issues(hass)) == {(DOMAIN, ISSUE_ID)}
+        assert unreachable_issue_id(OTHER_ADDRESS) != ISSUE_ID
+
+
+class TestProxyMemory:
+    """A dead link has no holding scanner, so the wizard can only offer a
+    proxy restart if one was written down while the link was up."""
+
+    @pytest.fixture
+    def holding_proxy(self, monkeypatch):
+        allocation = SimpleNamespace(
+            source=PROXY_SOURCE, slots=3, free=2, allocated=[ADDRESS]
+        )
+        manager = SimpleNamespace(
+            async_current_allocations=lambda source=None: [allocation],
+            async_register_allocation_callback=lambda cb, source=None: (
+                self._callbacks.append(cb) or (lambda: None)
+            ),
+        )
+        self._callbacks: list = []
+        monkeypatch.setattr(coordinator_module, "get_manager", lambda: manager)
+        monkeypatch.setattr(
+            coordinator_module.bluetooth,
+            "async_scanner_by_source",
+            lambda hass, source: SimpleNamespace(name=PROXY),
+        )
+        return self
+
+    def test_holding_proxy_is_persisted_while_the_link_is_up(self, holding_proxy):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, _, watchdog = build(hass, entry, connected=True)
+        watchdog.async_start()
+
+        # Delivered the way habluetooth delivers it, which also proves the
+        # subscription is live.
+        for callback in self._callbacks:
+            callback(None)
+
+        assert entry.options[CONF_LAST_HOLDING_PROXY] == PROXY
+        # Written once, not on every allocation report: each write is a
+        # config-entry update.
+        assert len(hass.config_entries.option_writes) == 1
+
+
+class TestRecoveryMenu:
+    def make_flow(self, hass: FakeHass, issue_id: str = ISSUE_ID):
+        flow = asyncio.run(async_create_fix_flow(hass, issue_id, None))
+        flow.hass = hass
+        return flow
+
+    def test_restart_proxy_is_not_offered_without_a_known_proxy(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry, services={"esphome": {PROXY_ACTION: object()}})
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(self.make_flow(hass).async_step_init())
+
+        assert result["type"] == "menu"
+        assert "restart_proxy" not in result["menu_options"]
+
+    def test_restart_proxy_is_not_offered_without_the_matching_action(self):
+        """A proxy that does not expose the restart action must not be
+        advertised as a fix."""
+        entry = FakeEntry(
+            "e1", "Tent Vent Fan", ADDRESS, **{CONF_LAST_HOLDING_PROXY: PROXY}
+        )
+        hass = FakeHass(entry, services={"esphome": {"some_other_node_restart": {}}})
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(self.make_flow(hass).async_step_init())
+
+        assert "restart_proxy" not in result["menu_options"]
+
+    def test_restart_proxy_is_offered_when_proxy_and_action_exist(self):
+        entry = FakeEntry(
+            "e1", "Tent Vent Fan", ADDRESS, **{CONF_LAST_HOLDING_PROXY: PROXY}
+        )
+        hass = FakeHass(entry, services={"esphome": {PROXY_ACTION: object()}})
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(self.make_flow(hass).async_step_init())
+
+        assert result["menu_options"] == [
+            "recheck",
+            "reload",
+            "restart_proxy",
+            "power_cycle",
+        ]
+
+    def test_first_entry_reports_no_previous_attempt(self):
+        """Never the string "None": that placeholder is rendered to the
+        operator."""
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(self.make_flow(hass).async_step_init())
+
+        assert result["description_placeholders"]["last_result"] == ""
+        assert result["description_placeholders"]["link"] == "disconnected"
+
+    def test_unloaded_entry_aborts(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        entry.state = ConfigEntryState.SETUP_RETRY
+        hass = FakeHass(entry)
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(self.make_flow(hass).async_step_init())
+
+        assert result["type"] == "abort"
+        assert result["reason"] == "entry_not_loaded"
+
+    def test_issue_for_an_unknown_fan_aborts(self):
+        hass = FakeHass()
+
+        result = asyncio.run(self.make_flow(hass, "DEADBEEF_unreachable").async_step_init())
+
+        assert result["type"] == "abort"
+        assert result["reason"] == "entry_not_loaded"
+
+
+class TestRecoveryActions:
+    @pytest.fixture(autouse=True)
+    def no_waiting(self, monkeypatch):
+        """Collapse every wait: the ladder's timing is not what is tested."""
+        monkeypatch.setattr(repairs_module, "RECOVERY_TIMEOUT", 0)
+        monkeypatch.setattr(repairs_module, "POWER_CYCLE_TIMEOUT", 0)
+        monkeypatch.setattr(repairs_module, "POWER_CYCLE_OFF_SECONDS", 0)
+
+    def make_flow(self, hass: FakeHass):
+        flow = asyncio.run(async_create_fix_flow(hass, ISSUE_ID, None))
+        flow.hass = hass
+        return flow
+
+    def test_a_healthy_link_finishes_the_flow_and_clears_the_issue(self):
+        """Finishing makes HA drop the issue; the integration's own reconcile
+        must delete it too, so the repair cannot outlive the fault."""
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, _, watchdog = build(hass, entry, connected=True)
+        watchdog.async_start()
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            ISSUE_ID,
+            is_fixable=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="device_unreachable",
+        )
+
+        result = asyncio.run(self.make_flow(hass).async_step_reload())
+
+        assert result["type"] == "create_entry"
+        assert hass.config_entries.reloads == ["e1"]
+        assert issues(hass) == {}
+
+    def test_a_still_dead_link_returns_to_the_menu(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(self.make_flow(hass).async_step_reload())
+
+        assert result["type"] == "menu"
+        assert result["description_placeholders"]["last_result"]
+
+    def test_power_cycle_remembers_the_outlet_and_switches_it(self):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(
+            self.make_flow(hass).async_step_power_cycle(
+                {CONF_RECOVERY_OUTLET: "switch.tent_outlet"}
+            )
+        )
+
+        assert entry.options[CONF_RECOVERY_OUTLET] == "switch.tent_outlet"
+        assert hass.services.calls == [
+            ("switch", "turn_off", {"entity_id": "switch.tent_outlet"}),
+            ("switch", "turn_on", {"entity_id": "switch.tent_outlet"}),
+        ]
+        assert result["type"] == "menu"
+
+    def test_power_cycle_restores_power_when_the_flow_is_cancelled(
+        self, monkeypatch
+    ):
+        """Closing the repair dialog cancels the flow task. Mains must come
+        back anyway — this is the one rung that can leave a fan dark."""
+        monkeypatch.setattr(repairs_module, "POWER_CYCLE_OFF_SECONDS", 0.2)
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        build(hass, entry, connected=False)
+        flow = self.make_flow(hass)
+
+        async def scenario():
+            task = asyncio.get_running_loop().create_task(
+                flow.async_step_power_cycle(
+                    {CONF_RECOVERY_OUTLET: "switch.tent_outlet"}
+                )
+            )
+            await asyncio.sleep(0.05)  # inside the mains-off window
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            # Let the shielded turn-on finish.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return [service for _domain, service, _data in hass.services.calls]
+
+        assert asyncio.run(scenario()) == ["turn_off", "turn_on"]
+
+    def test_power_cycle_form_prefills_a_remembered_outlet(self):
+        entry = FakeEntry(
+            "e1",
+            "Tent Vent Fan",
+            ADDRESS,
+            **{CONF_RECOVERY_OUTLET: "switch.tent_outlet"},
+        )
+        hass = FakeHass(entry)
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(self.make_flow(hass).async_step_power_cycle())
+
+        assert result["type"] == "form"
+        defaults = {
+            str(key): key.default() for key in result["data_schema"].schema
+        }
+        assert defaults == {CONF_RECOVERY_OUTLET: "switch.tent_outlet"}
+
+    def test_restart_proxy_calls_the_discovered_action(self):
+        entry = FakeEntry(
+            "e1", "Tent Vent Fan", ADDRESS, **{CONF_LAST_HOLDING_PROXY: PROXY}
+        )
+        hass = FakeHass(entry, services={"esphome": {PROXY_ACTION: object()}})
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(self.make_flow(hass).async_step_restart_proxy())
+
+        assert hass.services.calls == [("esphome", PROXY_ACTION, None)]
+        assert result["type"] == "menu"
+
+
+class TestOptionsBookkeeping:
+    """The proxy memory lives in entry.options next to a user-facing option."""
+
+    def test_toggling_the_hold_keeps_the_remembered_proxy_and_outlet(self):
+        """The options form does not offer these two keys, so submitting it
+        must merge, not replace — otherwise one hold toggle silently forgets
+        which proxy to restart and which outlet to cut."""
+        handler = OptionsFlowHandler()
+        handler.config_entry = SimpleNamespace(
+            options={
+                CONF_HOLD_CONNECTION: True,
+                CONF_LAST_HOLDING_PROXY: PROXY,
+                CONF_RECOVERY_OUTLET: "switch.tent_outlet",
+            }
+        )
+
+        result = asyncio.run(
+            handler.async_step_init({CONF_HOLD_CONNECTION: False})
+        )
+
+        assert result["data"] == {
+            CONF_HOLD_CONNECTION: False,
+            CONF_LAST_HOLDING_PROXY: PROXY,
+            CONF_RECOVERY_OUTLET: "switch.tent_outlet",
+        }

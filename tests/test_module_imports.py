@@ -22,6 +22,7 @@ MODULES = [
     "custom_components.ac_infinity.hold",
     "custom_components.ac_infinity.models",
     "custom_components.ac_infinity.number",
+    "custom_components.ac_infinity.repairs",
     "custom_components.ac_infinity.sensor",
     "custom_components.ac_infinity.switch",
     "custom_components.ac_infinity.ac_infinity_ble",
