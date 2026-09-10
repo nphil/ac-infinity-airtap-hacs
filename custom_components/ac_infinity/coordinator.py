@@ -83,24 +83,78 @@ _POLL_SEMAPHORE = asyncio.Semaphore(_POLL_SLOTS)
 UNREACHABLE_AFTER = timedelta(minutes=15)
 
 
-@callback
-def async_holding_scanner_name(hass: HomeAssistant, address: str) -> str | None:
-    """Name of the scanner/proxy currently holding a link to ``address``.
+def _async_holding_scanner(
+    hass: HomeAssistant, address: str
+) -> tuple[str, bluetooth.BaseHaScanner | None] | None:
+    """(source, scanner) for the slot currently holding ``address``.
 
     habluetooth's slot-allocation table is the same source Home Assistant's
     own ``bluetooth/subscribe_connection_allocations`` websocket serves, so
     this answers "which proxy is carrying this fan right now" without poking
     at private scanner state.  None when no scanner reports the address —
     either nothing is connected, or the connection is via a path that does
-    not report slot allocations.
+    not report slot allocations.  The scanner is None when Home Assistant
+    has none registered under that source.
     """
     source = allocation_source_for_address(
         get_manager().async_current_allocations(), address
     )
     if source is None:
         return None
-    scanner = bluetooth.async_scanner_by_source(hass, source)
+    return source, bluetooth.async_scanner_by_source(hass, source)
+
+
+@callback
+def async_holding_scanner_name(hass: HomeAssistant, address: str) -> str | None:
+    """Display name of the scanner/proxy currently holding a link to ``address``.
+
+    This is what the Connection sensor shows.  For a remote scanner it is
+    habluetooth's ``"<node> (<MAC>)"`` — see ``async_holding_proxy_node`` for
+    the bare node name the ESPHome action lookup needs.
+    """
+    holder = _async_holding_scanner(hass, address)
+    if holder is None:
+        return None
+    source, scanner = holder
     return scanner.name if scanner is not None else source
+
+
+@callback
+def async_holding_proxy_node(hass: HomeAssistant, address: str) -> str | None:
+    """ESPHome node name of the proxy currently holding a link to ``address``.
+
+    Not ``async_holding_scanner_name``: habluetooth builds a remote scanner's
+    ``name`` as ``"<adapter> (<source>)"``, verified live on 2026-09-09 via
+    ``bluetooth/subscribe_scanner_details`` — every proxy reported
+    ``name="plant-room-bluetooth-proxy (54:32:04:3E:F3:72)"`` next to
+    ``adapter="plant-room-bluetooth-proxy"``, while the registered action was
+    ``esphome.plant_room_bluetooth_proxy_restart_proxy``.  Slugifying the
+    display name looks up ``plant_room_bluetooth_proxy_54_32_04_3e_f3_72_…``,
+    finds nothing, and silently drops the wizard's proxy rung.
+
+    ``adapter`` is the node name ESPHome registered with, so it also survives
+    the proxy's HA device being renamed or moved between areas
+    (``downstairs-bluetooth-proxy`` kept its node name after its HA device
+    moved to the Tool Room).  Falls back to the source MAC when no scanner is
+    registered: that matches no ESPHome action, which is the honest answer.
+    """
+    holder = _async_holding_scanner(hass, address)
+    if holder is None:
+        return None
+    source, scanner = holder
+    return proxy_node_name(scanner) if scanner is not None else source
+
+
+def proxy_node_name(scanner: bluetooth.BaseHaScanner) -> str:
+    """Bare node name of ``scanner``: ``adapter``, else its name before " (".
+
+    The split covers a scanner without ``adapter`` (a stub, or one whose
+    ``name`` is all it exposes); neither branch ever yields the MAC suffix.
+    """
+    adapter = getattr(scanner, "adapter", None)
+    if adapter:
+        return adapter
+    return scanner.name.split(" (")[0]
 
 
 def unreachable_issue_id(address: str) -> str:
@@ -525,16 +579,17 @@ class ACInfinityLinkWatchdog:
         a proxy at Fix time.  Written only when it changed — every write is a
         config-entry update, and a fan that roams between two proxies would
         otherwise churn storage (and fire the entry update listener) on every
-        reconnect.
+        reconnect.  The node name, not the display name: this record exists
+        only to derive the ESPHome restart action later.
         """
-        scanner = async_holding_scanner_name(self.hass, self.address)
-        if scanner is None:
+        node = async_holding_proxy_node(self.hass, self.address)
+        if node is None:
             return
-        if self.entry.options.get(CONF_LAST_HOLDING_PROXY) == scanner:
+        if self.entry.options.get(CONF_LAST_HOLDING_PROXY) == node:
             return
         self.hass.config_entries.async_update_entry(
             self.entry,
-            options={**self.entry.options, CONF_LAST_HOLDING_PROXY: scanner},
+            options={**self.entry.options, CONF_LAST_HOLDING_PROXY: node},
         )
 
 

@@ -55,7 +55,11 @@ OTHER_ADDRESS = "11:22:33:44:55:66"
 ISSUE_ID = unreachable_issue_id(ADDRESS)
 PROXY = "plant-room-bluetooth-proxy"
 PROXY_ACTION = "plant_room_bluetooth_proxy_restart_proxy"
-PROXY_SOURCE = "F0:F0:F0:F0:F0:F0"
+PROXY_SOURCE = "54:32:04:3E:F3:72"
+# habluetooth names a remote scanner "<node> (<MAC>)" — verified live via
+# bluetooth/subscribe_scanner_details on 2026-09-09.  Slugified whole, it
+# matches no ESPHome action.
+PROXY_SCANNER_NAME = f"{PROXY} ({PROXY_SOURCE})"
 
 
 class FakeClient:
@@ -380,29 +384,47 @@ class TestPerEntryIsolation:
         assert unreachable_issue_id(OTHER_ADDRESS) != ISSUE_ID
 
 
+def hold_through(monkeypatch, scanner) -> list:
+    """Make habluetooth report ``scanner`` as holding ADDRESS's slot.
+
+    Returns the list allocation callbacks get registered into, so a test
+    can deliver a slot change the way habluetooth does.
+    """
+    callbacks: list = []
+    allocation = SimpleNamespace(
+        source=PROXY_SOURCE, slots=3, free=2, allocated=[ADDRESS]
+    )
+    manager = SimpleNamespace(
+        async_current_allocations=lambda source=None: [allocation],
+        async_register_allocation_callback=lambda cb, source=None: (
+            callbacks.append(cb) or (lambda: None)
+        ),
+    )
+    monkeypatch.setattr(coordinator_module, "get_manager", lambda: manager)
+    monkeypatch.setattr(
+        coordinator_module.bluetooth,
+        "async_scanner_by_source",
+        lambda hass, source: scanner,
+    )
+    return callbacks
+
+
 class TestProxyMemory:
     """A dead link has no holding scanner, so the wizard can only offer a
     proxy restart if one was written down while the link was up."""
 
     @pytest.fixture
     def holding_proxy(self, monkeypatch):
-        allocation = SimpleNamespace(
-            source=PROXY_SOURCE, slots=3, free=2, allocated=[ADDRESS]
+        self._callbacks = hold_through(
+            monkeypatch, SimpleNamespace(adapter=PROXY, name=PROXY_SCANNER_NAME)
         )
-        manager = SimpleNamespace(
-            async_current_allocations=lambda source=None: [allocation],
-            async_register_allocation_callback=lambda cb, source=None: (
-                self._callbacks.append(cb) or (lambda: None)
-            ),
+
+    @pytest.fixture
+    def holding_proxy_without_adapter(self, monkeypatch):
+        """A scanner that exposes only its display name."""
+        self._callbacks = hold_through(
+            monkeypatch, SimpleNamespace(name=PROXY_SCANNER_NAME)
         )
-        self._callbacks: list = []
-        monkeypatch.setattr(coordinator_module, "get_manager", lambda: manager)
-        monkeypatch.setattr(
-            coordinator_module.bluetooth,
-            "async_scanner_by_source",
-            lambda hass, source: SimpleNamespace(name=PROXY),
-        )
-        return self
 
     def test_holding_proxy_is_persisted_while_the_link_is_up(self, holding_proxy):
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
@@ -419,6 +441,22 @@ class TestProxyMemory:
         # Written once, not on every allocation report: each write is a
         # config-entry update.
         assert len(hass.config_entries.option_writes) == 1
+
+    def test_remembered_proxy_is_the_node_name_not_the_display_name(
+        self, holding_proxy_without_adapter
+    ):
+        """The record exists to name an ESPHome action, so it must be the
+        bare node even when all the scanner offers is "<node> (<MAC>)"."""
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, _, watchdog = build(hass, entry, connected=True)
+        watchdog.async_start()
+
+        for callback in self._callbacks:
+            callback(None)
+
+        assert entry.options[CONF_LAST_HOLDING_PROXY] == PROXY
+        assert "(" not in entry.options[CONF_LAST_HOLDING_PROXY]
 
 
 class TestRecoveryMenu:
@@ -465,6 +503,36 @@ class TestRecoveryMenu:
             "restart_proxy",
             "power_cycle",
         ]
+
+    def test_restart_proxy_is_offered_for_the_live_holder(self, monkeypatch):
+        """No remembered proxy: the rung comes from the scanner holding the
+        slot right now, whose name carries the MAC suffix."""
+        hold_through(
+            monkeypatch, SimpleNamespace(adapter=PROXY, name=PROXY_SCANNER_NAME)
+        )
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry, services={"esphome": {PROXY_ACTION: object()}})
+        build(hass, entry, connected=True)
+
+        result = asyncio.run(self.make_flow(hass).async_step_init())
+
+        assert "restart_proxy" in result["menu_options"]
+
+    def test_restart_proxy_is_offered_for_a_record_written_as_a_display_name(self):
+        """Options written before the node-name cutover hold "<node> (<MAC>)"
+        and an unreachable fan cannot rewrite them."""
+        entry = FakeEntry(
+            "e1",
+            "Tent Vent Fan",
+            ADDRESS,
+            **{CONF_LAST_HOLDING_PROXY: PROXY_SCANNER_NAME},
+        )
+        hass = FakeHass(entry, services={"esphome": {PROXY_ACTION: object()}})
+        build(hass, entry, connected=False)
+
+        result = asyncio.run(self.make_flow(hass).async_step_restart_proxy())
+
+        assert hass.services.calls == [("esphome", PROXY_ACTION, None)]
 
     def test_first_entry_reports_no_previous_attempt(self):
         """Never the string "None": that placeholder is rendered to the

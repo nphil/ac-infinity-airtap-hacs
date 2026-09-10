@@ -47,7 +47,7 @@ from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
 from homeassistant.util import slugify
 
 from .const import CONF_LAST_HOLDING_PROXY, CONF_RECOVERY_OUTLET, DOMAIN
-from .coordinator import async_holding_scanner_name, unreachable_issue_id
+from .coordinator import async_holding_proxy_node, unreachable_issue_id
 from .hold import STATE_CONNECTED, STATE_DISCONNECTED
 from .models import ACInfinityData
 
@@ -278,20 +278,28 @@ class BleRecoveryFixFlow(RepairsFlow):
 
     @property
     def _proxy_action(self) -> tuple[str, str] | None:
-        """(proxy name, esphome action) that can restart this fan's proxy.
+        """(proxy node, esphome action) that can restart this fan's proxy.
 
         The current holder if there is one, otherwise the one written down
         while the link was last up — an unreachable fan is held by nobody, so
-        without that record there is nothing to restart.
+        without that record there is nothing to restart.  Both are the bare
+        ESPHome node name (``async_holding_proxy_node``), never the
+        ``"<node> (<MAC>)"`` display name the Connection sensor shows: the
+        action is registered off the node name, and a wrongly derived one
+        resolves to nothing and silently drops this rung.
         """
         entry = self._entry
         if entry is None:
             return None
-        proxy = async_holding_scanner_name(
+        proxy = async_holding_proxy_node(
             self.hass, entry.data[CONF_ADDRESS].upper()
         ) or entry.options.get(CONF_LAST_HOLDING_PROXY)
         if not proxy:
             return None
+        # Records written before the node-name cutover hold the display name
+        # — and an unreachable fan cannot rewrite its record until the link
+        # is back, which is exactly when this is asked.
+        proxy = proxy.split(" (")[0]
         # `plant-room-bluetooth-proxy` -> `plant_room_bluetooth_proxy_restart_proxy`
         action = f"{slugify(proxy)}{RESTART_PROXY_ACTION}"
         # has_service, not async_services(): core's own docstring warns that
