@@ -190,6 +190,50 @@ def parse_manufacturer_data(data: bytes) -> DeviceInfo:
     return device
 
 
+def parse_model_data(frame: bytes) -> dict[int, bytes]:
+    """Split a ``get_model_data`` response into its ``{opcode: value}`` groups.
+
+    The response is the request's own payload grammar echoed back —
+    ``[opcode, length, value...]`` repeated — inside the standard frame, so
+    the payload runs from offset 10 for the length declared at offsets 2-3.
+    Walking it is strictly better than the fixed offsets the parsers used
+    before: it tolerates a model whose group lengths differ, and it is the
+    only way to read the groups after the variable-length AUTO block.
+
+    Verified against live AIRTAP T-series (type 6) responses captured on
+    2026-09-10; all six fans answered with the same eight groups::
+
+        16:1  work_type          19:7  AUTO threshold block
+        17:1  level_off          20:4  TIMER TO ON  duration
+        18:1  level_on           21:4  TIMER TO OFF duration
+                                 22:8  CYCLE on + off durations
+                                 23:0  absent on this model
+
+    Returns an empty dict for anything that is not a complete, exactly
+    consumed response: responses are not sequence-correlated, so a caller
+    can be handed an ack or a stale frame from an earlier command, and
+    parsing one of those would poison the state.
+    """
+    if len(frame) < 12:
+        return {}
+    length = (frame[2] << 8) | frame[3]
+    end = 10 + length
+    # +2 for the trailing CRC; a frame shorter than that is truncated.
+    if length <= 0 or len(frame) < end + 2:
+        return {}
+    groups: dict[int, bytes] = {}
+    i = 10
+    while i < end:
+        if i + 2 > end:
+            return {}
+        opcode, size = frame[i], frame[i + 1]
+        if i + 2 + size > end:
+            return {}
+        groups[opcode] = frame[i + 2 : i + 2 + size]
+        i += 2 + size
+    return groups
+
+
 class Protocol:
     """Protocol for AC Infinity Controllers."""
 

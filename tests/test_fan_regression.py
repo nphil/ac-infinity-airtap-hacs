@@ -18,8 +18,15 @@ how it sequences writes around the BLE await.
 import asyncio
 from types import SimpleNamespace
 
-from custom_components.ac_infinity.device import DeviceInfoEx
-from custom_components.ac_infinity.fan import PRESET_AUTO_MODE, ACInfinityFan
+from custom_components.ac_infinity.device import (WORK_TYPE_AUTO,
+                                                  WORK_TYPE_CYCLE,
+                                                  WORK_TYPE_TIMER_TO_OFF,
+                                                  WORK_TYPE_TIMER_TO_ON,
+                                                  DeviceInfoEx)
+from custom_components.ac_infinity.fan import (PRESET_AUTO_MODE, PRESET_CYCLE,
+                                               PRESET_TIMER_TO_OFF,
+                                               PRESET_TIMER_TO_ON,
+                                               ACInfinityFan)
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
 
@@ -37,8 +44,9 @@ class FakeDevice:
     def is_on(self) -> bool:
         return bool(self.state.work_type == 2 and self.state.fan)
 
-    async def set_mode_auto(self) -> None:
-        self.calls.append(("set_mode_auto",))
+    async def async_set_work_type(self, work_type: int) -> None:
+        self.calls.append(("async_set_work_type", work_type))
+        self.state.work_type = work_type
 
     async def set_speed(self, speed: int) -> None:
         self.calls.append(("set_speed", speed))
@@ -65,7 +73,7 @@ class TestPresetModeOptimism:
     def test_preset_auto_updates_state_immediately(self):
         fan, device, coordinator = make_fan()
         asyncio.run(fan.async_set_preset_mode(PRESET_AUTO_MODE))
-        assert ("set_mode_auto",) in device.calls
+        assert ("async_set_work_type", WORK_TYPE_AUTO) in device.calls
         assert fan.preset_mode == PRESET_AUTO_MODE
         assert fan.is_on is True
         assert fan.write_ha_state_calls >= 1
@@ -76,8 +84,43 @@ class TestPresetModeOptimism:
     def test_turn_on_with_preset_routes_through_preset_path(self):
         fan, device, _ = make_fan()
         asyncio.run(fan.async_turn_on(preset_mode=PRESET_AUTO_MODE))
-        assert ("set_mode_auto",) in device.calls
+        assert ("async_set_work_type", WORK_TYPE_AUTO) in device.calls
         assert fan.preset_mode == PRESET_AUTO_MODE
+
+    def test_every_timer_preset_selects_its_own_work_type(self):
+        """The four presets are distinct modes, not four names for AUTO."""
+        selected = []
+        for preset in (
+            PRESET_AUTO_MODE,
+            PRESET_TIMER_TO_ON,
+            PRESET_TIMER_TO_OFF,
+            PRESET_CYCLE,
+        ):
+            fan, device, _ = make_fan()
+            asyncio.run(fan.async_set_preset_mode(preset))
+            selected.append((preset, fan.preset_mode, device.calls[-1][1]))
+        assert selected == [
+            (PRESET_AUTO_MODE, PRESET_AUTO_MODE, WORK_TYPE_AUTO),
+            (PRESET_TIMER_TO_ON, PRESET_TIMER_TO_ON, WORK_TYPE_TIMER_TO_ON),
+            (PRESET_TIMER_TO_OFF, PRESET_TIMER_TO_OFF, WORK_TYPE_TIMER_TO_OFF),
+            (PRESET_CYCLE, PRESET_CYCLE, WORK_TYPE_CYCLE),
+        ]
+
+    def test_a_timer_to_on_fan_waiting_at_zero_still_reads_on(self):
+        """Otherwise an automation "turns it on" and cancels the countdown."""
+        fan, device, _ = make_fan(fan_speed=0)
+        device.state.work_type = WORK_TYPE_TIMER_TO_ON
+        fan._update_attrs()
+        assert (fan.is_on, fan.preset_mode) == (True, PRESET_TIMER_TO_ON)
+
+    def test_an_unknown_preset_is_refused(self):
+        fan, device, _ = make_fan()
+        try:
+            asyncio.run(fan.async_set_preset_mode("Schedule"))
+        except ValueError:
+            assert device.calls == []
+        else:
+            raise AssertionError("an unsupported mode must not reach the hardware")
 
 
 class TestSpeedClearsPreset:

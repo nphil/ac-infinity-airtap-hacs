@@ -14,19 +14,27 @@ descends from [hunterjm/ac-infinity-ble](https://github.com/hunterjm/ac-infinity
 Everything below is limited to what the reverse-engineered protocol code
 provably speaks today. No guessed commands are ever sent to the hardware.
 
-- **Fan entity** — OFF / ON with speed 1-10 (mapped to percentage), plus an
-  **Auto** preset that puts the device into its onboard AUTO mode.
+- **Fan entity** — OFF / ON with speed 1-10 (mapped to percentage), plus a
+  preset for each mode the fan runs by itself: **Auto**, **Timer to On**,
+  **Timer to Off** and **Cycle**.
 - **Auto-mode configuration** — number/switch entities for high/low
   temperature triggers and their enable flags, and min/max fan speed bounds
   used by AUTO. Written as the same threshold block the vendor app writes.
+- **Timer and cycle configuration** — number entities (in minutes) for the
+  two countdown timers and for the cycle's on/off phases. These are the
+  registers the fan's own control panel edits; the device stores them in
+  seconds and keeps them independently of which mode is selected, so a
+  duration can be prepared before the preset is switched.
 - **Sensors** — temperature, fan speed; humidity and VPD only on device
   types that actually carry those sensors. The AIRTAP (type 6) has **no
   humidity sensor** (the device reports a constant 0), so no humidity
   entities are created for it.
-- **Live push updates** — state follows BLE advertisements; a lightweight
-  GATT poll (at most every 30 s per fan, max 2 fans at a time) fills in
-  state that advertisements cannot carry (work mode, speed bounds, auto
-  thresholds).
+- **Live push updates** — state follows BLE advertisements, and a
+  lightweight GATT poll (at most every 30 s per fan, max 2 fans at a time)
+  fills in state that advertisements cannot carry (work mode, speed bounds,
+  auto thresholds, timer/cycle durations). Holding the connection silences
+  a fan's advertisements almost entirely, so while a link is held the poll
+  is driven by the link itself — on connect, then once a minute.
 - **Held Bluetooth connection** (option, on by default) — the GATT link to
   each fan stays open, so a command lands in ~0.2 s instead of paying a 2-6 s
   proxy connect. It costs one of a proxy's three connection slots per fan and
@@ -56,17 +64,16 @@ provably speaks today. No guessed commands are ever sent to the hardware.
 
 The protocol enumerates twelve work modes (`OFF`, `ON`, `AUTO`, `TIMER ON`,
 `TIMER OFF`, `CYCLE`, `SCHEDULE`, `VPD`, `TEMPERATURE PARAM`,
-`HUMIDITY PARAM`, `ADVANCE`, `AI`), but the reverse-engineered command
-builders only exist for **OFF, ON and AUTO**. The other modes:
+`HUMIDITY PARAM`, `ADVANCE`, `AI`). The first six are the ones the AIRTAP
+control panel itself offers, and all six are commandable here, each with the
+configuration register the device reports for it.
 
-- can be *observed* (if you set them from the official app, the integration
-  reports the fan as running in an unsupported preset),
-- cannot be *commanded* from Home Assistant, because no verified byte
-  sequences exist for them and this integration does not invent BLE writes.
-
-If you need timers/schedules, set them in the AC Infinity app; Home
-Assistant automations plus OFF/ON/AUTO cover the rest. Contributions with
-verified captures are welcome.
+Modes 7-12 are **not** commandable: the AIRTAP answers with an empty group
+for the `SCHEDULE` register and has no register at all for the rest, so
+there is nothing to configure and no verified byte sequence to select them.
+They can still be *observed* — if other hardware is running in one, the fan
+reports the mode and the preset chip is left blank. Contributions with
+verified captures from hardware that does support them are welcome.
 
 ## Installation
 

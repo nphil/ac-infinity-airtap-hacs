@@ -10,9 +10,12 @@ in order of frequency:
 2. GATT notifications and command commits pushed by the controller while a
    connection is open (forwarded via ``register_callback``).
 3. Periodic GATT polls for state that advertisements cannot carry
-   (work_type, level_on/level_off, auto-mode thresholds). Polls are
-   *advertisement-driven*: ``ActiveBluetoothDataUpdateCoordinator`` only
-   evaluates ``needs_poll`` while frames are flowing.
+   (work_type, level_on/level_off, auto-mode thresholds). The base
+   ``ActiveBluetoothDataUpdateCoordinator`` only evaluates ``needs_poll``
+   while frames are flowing, and a fan whose GATT link is held stops
+   advertising almost entirely, so polls are ALSO driven by the link
+   itself — once when it connects and then every LINK_POLL_INTERVAL for as
+   long as it stays up.
 
 Availability is advertisement-based, not poll-based: the base coordinator
 registers ``bluetooth.async_track_unavailable``, which flips ``available`` to
@@ -39,6 +42,8 @@ from time import monotonic
 from typing import TYPE_CHECKING
 
 from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
+from bluetooth_data_tools import monotonic_time_coarse
 from habluetooth import HaBluetoothSlotAllocations, get_manager
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.active_update_coordinator import (
@@ -51,7 +56,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
-from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
 from .ac_infinity_ble.const import MANUFACTURER_ID, CallbackType
 from .ac_infinity_ble.exceptions import CharacteristicMissingError
@@ -80,6 +85,19 @@ POLL_TIMEOUT = 45
 # headroom. Module-level on purpose: the cap must span all config entries.
 _POLL_SLOTS = 2
 _POLL_SEMAPHORE = asyncio.Semaphore(_POLL_SLOTS)
+
+# Poll cadence while a held GATT link is up. Before this existed, a held fan
+# was polled exactly once — by the cached advertisement replayed at start —
+# and never again: holding the link silences the fan's advertisements, and
+# polling in this coordinator family is advertisement-driven. Four of six
+# fans therefore sat with their auto-mode numbers and switches at "unknown"
+# for hours after a restart, and every threshold write raised "Auto mode
+# configuration is not loaded" (measured live 2026-09-10). On an already-open
+# link a poll costs one GATT write plus its notification — no connect, no
+# proxy slot — so a fixed cadence is cheap; it also picks up changes made on
+# the fan's own control panel, which is the only other writer while we hold
+# the link.
+LINK_POLL_INTERVAL = timedelta(seconds=60)
 
 # How long this entry's own BLE link must be continuously down before the
 # device_unreachable repair is raised. Deliberately long: the household heal
@@ -335,6 +353,9 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         # transition; also armed again by _async_handle_unavailable.
         self._was_unavailable = True
         self._cancel_controller_callback: Callable[[], None] | None = None
+        self._cancel_hold_listener: Callable[[], None] | None = None
+        self._cancel_link_poll_timer: CALLBACK_TYPE | None = None
+        self._link_poll_task: asyncio.Task[None] | None = None
         self._health_listener: CALLBACK_TYPE | None = None
 
     @property
@@ -402,6 +423,17 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         self._cancel_controller_callback = self.controller.register_callback(
             self._async_handle_controller_push
         )
+        # Link-driven polling — see LINK_POLL_INTERVAL. The hold status
+        # notifies on every reconnect-attempt change, so a link that has just
+        # come up is polled as soon as it is usable; the interval timer covers
+        # the steady state, where a silent held fan means nothing else would
+        # ever ask.
+        self._cancel_hold_listener = self.controller.hold_status.add_listener(
+            self._async_schedule_link_poll
+        )
+        self._cancel_link_poll_timer = async_track_time_interval(
+            self.hass, self._async_link_poll_tick, LINK_POLL_INTERVAL
+        )
 
     @callback
     def _async_stop(self) -> None:
@@ -409,6 +441,15 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         if self._cancel_controller_callback is not None:
             self._cancel_controller_callback()
             self._cancel_controller_callback = None
+        if self._cancel_hold_listener is not None:
+            self._cancel_hold_listener()
+            self._cancel_hold_listener = None
+        if self._cancel_link_poll_timer is not None:
+            self._cancel_link_poll_timer()
+            self._cancel_link_poll_timer = None
+        if self._link_poll_task is not None:
+            self._link_poll_task.cancel()
+            self._link_poll_task = None
         super()._async_stop()
 
     @callback
@@ -446,8 +487,65 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
             )
         )
 
+    @callback
+    def _async_link_poll_tick(self, _now: datetime) -> None:
+        self._async_schedule_link_poll()
+
+    @callback
+    def _async_schedule_link_poll(self) -> None:
+        """Poll over the live GATT link when one is up and a poll is due.
+
+        Reuses the base coordinator's ``_last_poll`` clock and the
+        controller's own 30 s floor, so this path and the advertisement-driven
+        one can never double-poll; ``update_needed`` also fast-tracks the
+        re-sync right after one of our own config writes.  A poll is only
+        worth anything on an established link — connecting is what the hold
+        supervisor is for — so a down link is simply skipped, not forced.
+        """
+        if self.hass.is_stopping or not self.controller.is_connected:
+            return
+        if self._link_poll_task is not None and not self._link_poll_task.done():
+            return
+        poll_age: float | None = None
+        if self._last_poll:
+            poll_age = monotonic_time_coarse() - self._last_poll
+        if not self.controller.update_needed(poll_age):
+            return
+        self._link_poll_task = self.hass.async_create_background_task(
+            self._async_link_poll(), f"ac_infinity link poll {self.address}"
+        )
+
+    async def _async_link_poll(self) -> None:
+        """One poll over the held link; a failure is logged, never fatal.
+
+        Unlike the base class's poll wrapper there is no
+        ``last_poll_successful`` bookkeeping to keep: a held link that cannot
+        answer a read is already reported as a drop by the hold supervisor,
+        and the next tick retries.
+        """
+        try:
+            await self._async_update()
+        except BleakError as exc:
+            self.logger.debug(
+                "%s (%s) link poll failed: %s",
+                self.ble_device.name,
+                self.ble_device.address,
+                exc,
+            )
+            return
+        except Exception:  # noqa: BLE001 - a background task must not die silently
+            self.logger.exception(
+                "%s (%s) link poll failed",
+                self.ble_device.name,
+                self.ble_device.address,
+            )
+            return
+        finally:
+            self._last_poll = monotonic_time_coarse()
+        self.async_update_listeners()
+
     async def _async_update(
-        self, service_info: bluetooth.BluetoothServiceInfoBleak
+        self, service_info: bluetooth.BluetoothServiceInfoBleak | None = None
     ) -> None:
         """Poll the device for state advertisements cannot carry.
 

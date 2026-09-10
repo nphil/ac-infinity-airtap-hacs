@@ -192,6 +192,11 @@ def install() -> bool:
     class UnitOfPressure(StrEnum):
         KPA = "kPa"
 
+    class UnitOfTime(StrEnum):
+        SECONDS = "s"
+        MINUTES = "min"
+        HOURS = "h"
+
     class Platform(StrEnum):
         FAN = "fan"
         NUMBER = "number"
@@ -204,6 +209,7 @@ def install() -> bool:
 
     const.UnitOfTemperature = UnitOfTemperature
     const.UnitOfPressure = UnitOfPressure
+    const.UnitOfTime = UnitOfTime
     const.Platform = Platform
     const.EntityCategory = EntityCategory
 
@@ -366,6 +372,11 @@ def install() -> bool:
             # Faithful to HA: `available` is a read-only property over
             # `_available`, which is what lets a subclass widen it.
             self._available = True
+            # Real base: the poll clock (monotonic_time_coarse) and the
+            # error-once flag. The link-driven poll path shares both, so
+            # they must exist here or it would double-poll in tests.
+            self._last_poll = None
+            self.last_poll_successful = True
             self.listener_update_count = 0
             # Test bookkeeping: the real base's event handler is the ONLY
             # place that notifies listeners / re-marks availability /
@@ -525,6 +536,7 @@ def install() -> bool:
     class NumberDeviceClass(StrEnum):
         TEMPERATURE = "temperature"
         HUMIDITY = "humidity"
+        DURATION = "duration"
 
     class NumberMode(StrEnum):
         AUTO = "auto"
@@ -715,6 +727,27 @@ def install() -> bool:
                 timers.remove(timer)
 
         return cancel
+
+    def async_track_time_interval(hass, action, interval, *, name=None, cancel_on_shutdown=None):
+        """Record the interval timer; tests fire it by hand.
+
+        Same rule as async_call_later: no real timer may be armed under
+        pytest, and cancelling must actually remove the record.
+        """
+        timers = getattr(hass, "interval_timers", None)
+        if timers is None:
+            timers = []
+            hass.interval_timers = timers
+        timer = (interval, action)
+        timers.append(timer)
+
+        def cancel() -> None:
+            if timer in timers:
+                timers.remove(timer)
+
+        return cancel
+
+    event.async_track_time_interval = async_track_time_interval
 
     event.async_call_later = async_call_later
 

@@ -1,12 +1,15 @@
 """Integration-side wrapper around the vendored AC Infinity BLE controller.
 
-Adds what the vendored library does not model: the AUTO work mode (mode 3),
-its temperature/humidity threshold configuration, and min/max speed bounds.
+Adds what the vendored library does not model: the work modes beyond OFF/ON
+(AUTO, the two countdown timers and CYCLE), their configuration registers,
+and min/max speed bounds.
 
-HARDWARE SAFETY: every byte sequence sent from this module reuses command
-builders/framing already present in the vendored library (``Protocol._add_head``
-with command IDs 16-19 observed from the official app). Do not invent new
-register writes here.
+HARDWARE SAFETY: every byte sequence sent from this module follows the
+payload grammar the vendored library already encodes (``[opcode, length,
+value...]`` groups wrapped by ``Protocol._add_head``), writing only the
+registers the device itself reports in its ``get_model_data`` response.
+Do not invent register numbers here; add one only after a live capture
+shows the device answering for it.
 """
 from __future__ import annotations
 
@@ -22,17 +25,47 @@ from bleak.backends.scanner import AdvertisementData
 
 from .ac_infinity_ble import ACInfinityController, DeviceInfo
 from .ac_infinity_ble.const import CallbackType
+from .ac_infinity_ble.protocol import get_mode, parse_model_data
 from .ac_infinity_ble.util import get_bit
 from .const import FAMILY_E_MODELS
 from .hold import HOLD_FAILURE_LOG_EVERY, HoldStatus, backoff_delay
 
-# Work types (mode register values) with working command builders. The
-# protocol enumerates modes 1-12 (see ac_infinity_ble/protocol.py get_mode),
-# but only these three can currently be COMMANDED; the rest are read-only
-# labels — documented as known gaps in the README.
+# Work types (mode register values). The protocol enumerates modes 1-12 (see
+# ac_infinity_ble/protocol.py get_mode); the AIRTAP T-series exposes exactly
+# the six below on its own control panel ("OFF, ON, AUTO (2 triggers), TIMER
+# TO ON, TIMER TO OFF, and CYCLE" — AIRTAP series manual), and its
+# get_model_data response carries a configuration register for each of them
+# (opcodes 19-22) and an empty group for the SCHEDULE register (23) other
+# hardware has. Modes 7-12 have no register on this hardware and are
+# read-only labels; see the README.
 WORK_TYPE_OFF = 1
 WORK_TYPE_ON = 2
 WORK_TYPE_AUTO = 3
+WORK_TYPE_TIMER_TO_ON = 4
+WORK_TYPE_TIMER_TO_OFF = 5
+WORK_TYPE_CYCLE = 6
+
+# Configuration registers, by mode. Named here because they appear both in
+# the poll parser and in the writers.
+OPCODE_MIN_SPEED = 17
+OPCODE_MAX_SPEED = 18
+OPCODE_AUTO_THRESHOLDS = 19
+OPCODE_TIMER_TO_ON = 20
+OPCODE_TIMER_TO_OFF = 21
+OPCODE_CYCLE = 22
+
+# Longest duration the AIRTAP control panel can express (23:59:00). The
+# registers are four bytes wide, so this bound is the hardware's, not the
+# wire format's; it keeps a mistyped automation from parking a fan on a
+# timer measured in weeks.
+MAX_DURATION_SECONDS = 23 * 3600 + 59 * 60
+
+# Modes ``async_set_work_type`` will send. OFF and ON are excluded on
+# purpose: they go through the vendored ``set_level`` builder, which writes
+# the mode AND its stored level in one frame.
+SELECTABLE_WORK_TYPES = frozenset(
+    {WORK_TYPE_AUTO, WORK_TYPE_TIMER_TO_ON, WORK_TYPE_TIMER_TO_OFF, WORK_TYPE_CYCLE}
+)
 
 # Log under the vendored controller's logger namespace so one logger line in
 # configuration.yaml captures the whole BLE conversation.
@@ -45,6 +78,26 @@ _LOGGER = logging.getLogger(ACInfinityController.__module__)
 # _config_changed_since_last_update so the next advertisement re-syncs
 # immediately after we change something ourselves.
 _MIN_SECONDS_BETWEEN_POLLS = 30
+
+
+def _duration(value: bytes | None) -> Optional[int]:
+    """Decode a duration register: a 32-bit big-endian count of seconds.
+
+    None for a register the device did not answer for, so an entity can stay
+    unknown rather than claim a zero the hardware never reported.
+    """
+    if value is None or len(value) < 4:
+        return None
+    return int.from_bytes(value[:4], "big")
+
+
+def _duration_bytes(seconds: int) -> list[int]:
+    """Encode a duration for a register, bounded by what the panel can set."""
+    if not 0 <= seconds <= MAX_DURATION_SECONDS:
+        raise ValueError(
+            f"duration must be between 0 and {MAX_DURATION_SECONDS} seconds"
+        )
+    return list(int(seconds).to_bytes(4, "big"))
 
 
 @dataclass
@@ -287,6 +340,26 @@ class ACInfinityDevice(ACInfinityController):
         return self._state.level_on
 
     @property
+    def timer_to_on(self) -> Optional[int]:
+        """TIMER TO ON countdown in seconds; None until the first poll."""
+        return self._state.timer_to_on
+
+    @property
+    def timer_to_off(self) -> Optional[int]:
+        """TIMER TO OFF countdown in seconds; None until the first poll."""
+        return self._state.timer_to_off
+
+    @property
+    def cycle_on(self) -> Optional[int]:
+        """CYCLE running phase in seconds; None until the first poll."""
+        return self._state.cycle_on
+
+    @property
+    def cycle_off(self) -> Optional[int]:
+        """CYCLE idle phase in seconds; None until the first poll."""
+        return self._state.cycle_off
+
+    @property
     def state(self) -> DeviceInfoEx:
         return self._state
 
@@ -301,41 +374,54 @@ class ACInfinityDevice(ACInfinityController):
     async def update(self) -> None:
         """Poll the device for state not present in BLE advertisements.
 
-        Fetches work_type, speed bounds and the AUTO-mode threshold block.
-        Response layout mirrors the vendored ``update()`` for bytes 12-18 and
-        extends it with the threshold block (bytes 21-27) observed from the
-        official app's model-data response.
+        Fetches work_type, the speed bounds, the AUTO threshold block and the
+        timer/cycle durations, by walking the response's ``[opcode, length,
+        value]`` groups (see ``parse_model_data``) rather than trusting fixed
+        offsets — which is what makes the groups past the AUTO block readable
+        at all.
         """
         await self._ensure_connected()
         try:
             _LOGGER.debug("%s: Updating model data", self.name)
             command = self._protocol.get_model_data(self.state.type, 0, self.sequence)
             if data := await self._send_command(command):
-                if len(data) < 28:
-                    # A short frame is a truncated/foreign response; parsing
-                    # it would poison work_type and the thresholds, so keep
-                    # the previous state and let the next poll retry.
+                groups = parse_model_data(data)
+                if 16 not in groups or len(groups.get(OPCODE_AUTO_THRESHOLDS, b"")) < 7:
+                    # An ack, or a stale response to an earlier command:
+                    # responses are not sequence-correlated. Keep the previous
+                    # state and let the next poll retry.
                     _LOGGER.debug(
-                        "%s: Skipping update; data too short (%s): %s",
+                        "%s: Skipping update; not a model-data response (%s): %s",
                         self.name,
                         len(data),
                         data.hex(),
                     )
                 else:
-                    self.state.work_type = data[12]
-                    self.state.level_off = data[15]
-                    self.state.level_on = data[18]
+                    self.state.work_type = groups[16][0]
+                    self.state.level_off = groups[OPCODE_MIN_SPEED][0]
+                    self.state.level_on = groups[OPCODE_MAX_SPEED][0]
 
+                    thresholds = groups[OPCODE_AUTO_THRESHOLDS]
                     self.state.auto_mode = AutoModeConfig(
-                        high_temp_enabled=not get_bit(data[21], 4),
-                        low_temp_enabled=not get_bit(data[21], 5),
-                        high_humidity_enabled=not get_bit(data[21], 6),
-                        low_humidity_enabled=not get_bit(data[21], 7),
-                        high_temp=data[23],
-                        low_temp=data[25],
-                        high_humidity=data[26],
-                        low_humidity=data[27],
+                        high_temp_enabled=not get_bit(thresholds[0], 4),
+                        low_temp_enabled=not get_bit(thresholds[0], 5),
+                        high_humidity_enabled=not get_bit(thresholds[0], 6),
+                        low_humidity_enabled=not get_bit(thresholds[0], 7),
+                        high_temp=thresholds[2],
+                        low_temp=thresholds[4],
+                        high_humidity=thresholds[5],
+                        low_humidity=thresholds[6],
                     )
+
+                    # Absent on a model that does not answer for the register
+                    # (the group is missing, or empty as opcode 23 is here);
+                    # leaving those None is what keeps their entities honest.
+                    self.state.timer_to_on = _duration(groups.get(OPCODE_TIMER_TO_ON))
+                    self.state.timer_to_off = _duration(groups.get(OPCODE_TIMER_TO_OFF))
+                    cycle = groups.get(OPCODE_CYCLE)
+                    if cycle is not None and len(cycle) >= 8:
+                        self.state.cycle_on = _duration(cycle[:4])
+                        self.state.cycle_off = _duration(cycle[4:8])
 
                     self._config_changed_since_last_update = False
                     self._fire_callbacks(CallbackType.UPDATE_RESPONSE)
@@ -347,15 +433,21 @@ class ACInfinityDevice(ACInfinityController):
             # ACInfinityController._execute_disconnect).
             await self._execute_disconnect()
 
-    async def set_mode_auto(self) -> None:
-        """Set the device's mode to automatic.
+    async def async_set_work_type(self, work_type: int) -> None:
+        """Select a work mode.
 
-        Command [16, 1, work_type] is the same mode register used by the
-        vendored ``set_level`` builder; 3 selects AUTO.
+        Payload ``[16, 1, work_type]`` is the mode half of the vendored
+        ``set_level`` builder, sent on its own: unlike ``set_level`` it does
+        NOT also rewrite a level, which is exactly right for the modes that
+        run themselves off a configuration register (AUTO, the two countdown
+        timers, CYCLE). OFF and ON keep going through ``set_level`` so they
+        continue to carry their stored level with them.
         """
-        _LOGGER.debug("%s: Setting mode to auto", self.name)
+        if work_type not in SELECTABLE_WORK_TYPES:
+            raise ValueError(f"Work type {work_type} cannot be selected")
+        _LOGGER.debug("%s: Setting mode to %s", self.name, get_mode(work_type))
 
-        command = [16, 1, WORK_TYPE_AUTO]
+        command = [16, 1, work_type]
         if self.state.type in FAMILY_E_MODELS:
             command += [255, 0]
         command = self._protocol._add_head(command, 3, self.sequence)
@@ -363,10 +455,14 @@ class ACInfinityDevice(ACInfinityController):
         try:
             await self._send_command(command)
 
-            self.state.work_type = WORK_TYPE_AUTO
+            self.state.work_type = work_type
             self._config_changed_since_last_update = True
         finally:
             await self._execute_disconnect()
+
+    async def set_mode_auto(self) -> None:
+        """Set the device's mode to automatic."""
+        await self.async_set_work_type(WORK_TYPE_AUTO)
 
     async def async_set_auto_high_temp(self, value: float) -> None:
         if self.auto_mode is None:
@@ -505,3 +601,60 @@ class ACInfinityDevice(ACInfinityController):
             self._config_changed_since_last_update = True
         finally:
             await self._execute_disconnect()
+
+    async def _async_write_register(self, opcode: int, value: list[int]) -> None:
+        """Write one ``[opcode, length, value...]`` configuration group."""
+        command = [opcode, len(value), *value]
+        if self.state.type in FAMILY_E_MODELS:
+            command += [255, 0]
+        command = self._protocol._add_head(command, 3, self.sequence)
+
+        await self._ensure_connected()
+        try:
+            await self._send_command(command)
+            self._config_changed_since_last_update = True
+        finally:
+            await self._execute_disconnect()
+
+    async def async_set_timer_to_on(self, seconds: int) -> None:
+        """Set the TIMER TO ON countdown (mode 4)."""
+        _LOGGER.debug("%s: Setting timer to on to %ss", self.name, seconds)
+        payload = _duration_bytes(seconds)
+        await self._async_write_register(OPCODE_TIMER_TO_ON, payload)
+        self.state.timer_to_on = seconds
+
+    async def async_set_timer_to_off(self, seconds: int) -> None:
+        """Set the TIMER TO OFF countdown (mode 5)."""
+        _LOGGER.debug("%s: Setting timer to off to %ss", self.name, seconds)
+        payload = _duration_bytes(seconds)
+        await self._async_write_register(OPCODE_TIMER_TO_OFF, payload)
+        self.state.timer_to_off = seconds
+
+    async def async_set_cycle(self, on_seconds: int, off_seconds: int) -> None:
+        """Write both halves of the CYCLE register (mode 6).
+
+        One register holds both phases, so — exactly like the AUTO threshold
+        block — a single-phase change is a read-modify-write against the last
+        polled pair rather than a partial write.
+        """
+        _LOGGER.debug(
+            "%s: Setting cycle to %ss on / %ss off", self.name, on_seconds, off_seconds
+        )
+        payload = _duration_bytes(on_seconds) + _duration_bytes(off_seconds)
+        await self._async_write_register(OPCODE_CYCLE, payload)
+        self.state.cycle_on = on_seconds
+        self.state.cycle_off = off_seconds
+
+    async def async_set_cycle_on(self, seconds: int) -> None:
+        if self.cycle_off is None:
+            raise ValueError(
+                "Cycle configuration is not loaded; cannot change configuration values"
+            )
+        await self.async_set_cycle(seconds, self.cycle_off)
+
+    async def async_set_cycle_off(self, seconds: int) -> None:
+        if self.cycle_on is None:
+            raise ValueError(
+                "Cycle configuration is not loaded; cannot change configuration values"
+            )
+        await self.async_set_cycle(self.cycle_on, seconds)

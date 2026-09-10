@@ -34,3 +34,10 @@ class DeviceInfo:
     work_type: int | None = None  # mode: 1=OFF, 2=ON, 3=AUTO (protocol.get_mode)
     level_on: int | None = None  # ON-mode level / AUTO maximum (opcode 18)
     level_off: int | None = None  # OFF-mode level / AUTO minimum (opcode 17)
+    # Durations, in seconds, of the modes that run on a clock. Each is the
+    # value stored in its own register (opcodes 20/21/22) and is independent
+    # of which mode is currently selected, exactly like the AUTO thresholds.
+    timer_to_on: int | None = None  # mode 4 countdown (opcode 20)
+    timer_to_off: int | None = None  # mode 5 countdown (opcode 21)
+    cycle_on: int | None = None  # mode 6 running phase (opcode 22, first half)
+    cycle_off: int | None = None  # mode 6 idle phase (opcode 22, second half)
