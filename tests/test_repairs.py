@@ -22,15 +22,17 @@ threshold can be reached without waiting for it.
 import asyncio
 import contextlib
 import logging
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
+import custom_components.ac_infinity as integration
 import custom_components.ac_infinity.coordinator as coordinator_module
 import custom_components.ac_infinity.repairs as repairs_module
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 
 from custom_components.ac_infinity.config_flow import OptionsFlowHandler
@@ -75,6 +77,7 @@ class FakeEntry:
         self.data = {"address": address}
         self.options = dict(options)
         self.state = ConfigEntryState.LOADED
+        self.disabled_by = None
 
 
 class FakeConfigEntries:
@@ -124,18 +127,68 @@ class FakeHass:
         self.services = FakeServices(services)
 
 
-def fire_timers(hass: FakeHass) -> int:
-    """Run every recorded ``async_call_later`` callback; returns how many."""
-    timers = getattr(hass, "pending_timers", [])
-    due = list(timers)
-    timers.clear()
-    for _delay, action in due:
-        action(datetime.now(timezone.utc))
-    return len(due)
+class Timeline:
+    """The monotonic clock the outage maths reads, plus the timers armed on it.
+
+    A timer fires only once the clock has actually reached its deadline, so
+    a test advances time the way the night did.  Firing whatever was recorded
+    (the stub's approach) cannot tell "raised 15 minutes after the first
+    drop" from "raised 15 minutes after the last reload" — the exact
+    distinction the autoheal measurement turned on.
+    """
+
+    def __init__(self, monkeypatch) -> None:
+        self.now = 1000.0
+        self.timers: list[tuple[float, Callable]] = []
+        monkeypatch.setattr(coordinator_module, "monotonic", lambda: self.now)
+        monkeypatch.setattr(coordinator_module, "async_call_later", self._call_later)
+
+    def _call_later(self, hass, delay, action):
+        seconds = delay.total_seconds() if isinstance(delay, timedelta) else delay
+        timer = (self.now + seconds, action)
+        self.timers.append(timer)
+
+        def cancel() -> None:
+            if timer in self.timers:
+                self.timers.remove(timer)
+
+        return cancel
+
+    @property
+    def deadlines(self) -> list[float]:
+        """Absolute clock readings the pending timers fire at."""
+        return sorted(when for when, _action in self.timers)
+
+    @property
+    def remaining(self) -> list[float]:
+        """Seconds from now until each pending timer fires."""
+        return [when - self.now for when in self.deadlines]
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        while due := sorted(t for t in self.timers if t[0] <= self.now):
+            for timer in due:
+                self.timers.remove(timer)
+                timer[1](datetime.now(timezone.utc))
 
 
-def pending_delays(hass: FakeHass) -> list:
-    return [delay for delay, _action in getattr(hass, "pending_timers", [])]
+THRESHOLD = UNREACHABLE_AFTER.total_seconds()
+
+
+@pytest.fixture(autouse=True)
+def timeline(monkeypatch) -> Timeline:
+    return Timeline(monkeypatch)
+
+
+def reload(hass: FakeHass, entry: FakeEntry, watchdog: ACInfinityLinkWatchdog, *, connected: bool):
+    """What async_unload_entry then async_setup_entry do to one fan's runtime
+    objects: the watchdog is stopped, the runtime data dropped, and a fresh
+    device/coordinator/watchdog trio is built and started."""
+    watchdog.async_stop()
+    hass.data[DOMAIN].pop(entry.entry_id)
+    device, coordinator, watchdog = build(hass, entry, connected=connected)
+    watchdog.async_start()
+    return device, coordinator, watchdog
 
 
 def build(hass: FakeHass, entry: FakeEntry, *, connected: bool, hold: bool = True):
@@ -211,7 +264,7 @@ class TestSetupReconciliation:
 
         assert (DOMAIN, ISSUE_ID) not in issues(hass)
 
-    def test_issue_survives_a_reload_while_the_link_is_still_down(self):
+    def test_issue_survives_a_reload_while_the_link_is_still_down(self, timeline):
         """The other half of the rule: reconciliation is unconditional, not
         blind. A still-broken fan keeps its repair across the reload, and the
         15-minute countdown does not start over (which would let a reload
@@ -231,11 +284,11 @@ class TestSetupReconciliation:
         watchdog.async_start()
 
         assert (DOMAIN, ISSUE_ID) in issues(hass)
-        assert pending_delays(hass) == []
+        assert timeline.remaining == []
 
 
 class TestUnreachableThreshold:
-    def test_nothing_is_raised_before_the_threshold(self):
+    def test_nothing_is_raised_before_the_threshold(self, timeline):
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
         hass = FakeHass(entry)
         _, _, watchdog = build(hass, entry, connected=False)
@@ -243,15 +296,17 @@ class TestUnreachableThreshold:
         watchdog.async_start()
 
         assert issues(hass) == {}
-        assert pending_delays(hass) == [UNREACHABLE_AFTER]
+        assert timeline.remaining == [THRESHOLD]
 
-    def test_issue_is_raised_once_the_threshold_passes(self):
+    def test_issue_is_raised_once_the_threshold_passes(self, timeline):
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
         hass = FakeHass(entry)
         _, _, watchdog = build(hass, entry, connected=False)
         watchdog.async_start()
 
-        assert fire_timers(hass) == 1
+        timeline.advance(THRESHOLD - 1)
+        assert issues(hass) == {}
+        timeline.advance(1)
 
         issue = issues(hass)[(DOMAIN, ISSUE_ID)]
         assert issue["is_fixable"] is True
@@ -259,33 +314,34 @@ class TestUnreachableThreshold:
         assert issue["translation_key"] == "device_unreachable"
         assert issue["translation_placeholders"]["name"] == "Tent Vent Fan"
 
-    def test_reconnect_deletes_the_issue(self):
+    def test_reconnect_deletes_the_issue(self, timeline):
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
         hass = FakeHass(entry)
         device, _, watchdog = build(hass, entry, connected=False)
         watchdog.async_start()
-        fire_timers(hass)
+        timeline.advance(THRESHOLD)
         assert (DOMAIN, ISSUE_ID) in issues(hass)
 
         reconnect(device)
 
         assert issues(hass) == {}
 
-    def test_reconnect_before_the_threshold_cancels_the_timer(self):
+    def test_reconnect_before_the_threshold_cancels_the_timer(self, timeline):
         """Otherwise the fan is marked unreachable 15 minutes after a blip it
         already recovered from."""
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
         hass = FakeHass(entry)
         device, _, watchdog = build(hass, entry, connected=False)
         watchdog.async_start()
-        assert pending_delays(hass) == [UNREACHABLE_AFTER]
+        assert timeline.remaining == [THRESHOLD]
 
         reconnect(device)
 
-        assert pending_delays(hass) == []
+        assert timeline.remaining == []
+        timeline.advance(THRESHOLD)
         assert issues(hass) == {}
 
-    def test_a_second_drop_arms_the_timer_again(self):
+    def test_a_second_drop_arms_the_timer_again(self, timeline):
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
         hass = FakeHass(entry)
         device, _, watchdog = build(hass, entry, connected=True)
@@ -293,12 +349,12 @@ class TestUnreachableThreshold:
 
         drop(device)
 
-        assert pending_delays(hass) == [UNREACHABLE_AFTER]
+        assert timeline.remaining == [THRESHOLD]
         assert issues(hass) == {}
-        assert fire_timers(hass) == 1
+        timeline.advance(THRESHOLD)
         assert (DOMAIN, ISSUE_ID) in issues(hass)
 
-    def test_unload_cancels_the_timer(self):
+    def test_unload_cancels_the_timer(self, timeline):
         """An orphaned timer would fire against a torn-down entry."""
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
         hass = FakeHass(entry)
@@ -307,9 +363,9 @@ class TestUnreachableThreshold:
 
         watchdog.async_stop()
 
-        assert pending_delays(hass) == []
+        assert timeline.remaining == []
         # And the link going up/down afterwards no longer touches issues.
-        assert fire_timers(hass) == 0
+        timeline.advance(THRESHOLD)
         assert issues(hass) == {}
 
 
@@ -328,7 +384,7 @@ class TestHoldDisabledEntry:
             advertisement=SimpleNamespace(manufacturer_data={}),
         )
 
-    def test_going_unavailable_then_the_threshold_raises_the_issue(self):
+    def test_going_unavailable_then_the_threshold_raises_the_issue(self, timeline):
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
         hass = FakeHass(entry)
         _, coordinator, watchdog = build(hass, entry, connected=False, hold=False)
@@ -337,24 +393,24 @@ class TestHoldDisabledEntry:
 
         coordinator._async_handle_unavailable(self.frame())
 
-        assert pending_delays(hass) == [UNREACHABLE_AFTER]
-        assert fire_timers(hass) == 1
+        assert timeline.remaining == [THRESHOLD]
+        timeline.advance(THRESHOLD)
         assert (DOMAIN, ISSUE_ID) in issues(hass)
 
-    def test_the_fan_being_seen_again_clears_the_issue(self):
+    def test_the_fan_being_seen_again_clears_the_issue(self, timeline):
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
         hass = FakeHass(entry)
         _, coordinator, watchdog = build(hass, entry, connected=False, hold=False)
         watchdog.async_start()
         coordinator._async_handle_unavailable(self.frame())
-        fire_timers(hass)
+        timeline.advance(THRESHOLD)
         assert (DOMAIN, ISSUE_ID) in issues(hass)
 
         coordinator._async_handle_bluetooth_event(self.frame(), object())
 
         assert issues(hass) == {}
 
-    def test_the_listener_is_dropped_on_unload(self):
+    def test_the_listener_is_dropped_on_unload(self, timeline):
         entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
         hass = FakeHass(entry)
         _, coordinator, watchdog = build(hass, entry, connected=False, hold=False)
@@ -363,11 +419,11 @@ class TestHoldDisabledEntry:
 
         coordinator._async_handle_unavailable(self.frame())
 
-        assert pending_delays(hass) == []
+        assert timeline.remaining == []
 
 
 class TestPerEntryIsolation:
-    def test_only_the_unreachable_fans_issue_is_raised(self):
+    def test_only_the_unreachable_fans_issue_is_raised(self, timeline):
         """Six entries share this code; one dead fan must raise exactly one
         repair, keyed to its own address."""
         down = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
@@ -378,10 +434,192 @@ class TestPerEntryIsolation:
 
         down_watchdog.async_start()
         up_watchdog.async_start()
-        fire_timers(hass)
+        timeline.advance(THRESHOLD)
 
         assert set(issues(hass)) == {(DOMAIN, ISSUE_ID)}
         assert unreachable_issue_id(OTHER_ADDRESS) != ISSUE_ID
+
+    def test_another_fans_lifecycle_leaves_the_outage_alone(self, timeline):
+        """The outage clock is process state keyed by address; a second fan
+        loading healthy, unloading and being removed must touch only its
+        own address."""
+        down = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        other = FakeEntry("e2", "Closet Vent Fan", OTHER_ADDRESS)
+        hass = FakeHass(down, other)
+        _, _, down_watchdog = build(hass, down, connected=False)
+        down_watchdog.async_start()
+        deadline = timeline.now + UNREACHABLE_AFTER.total_seconds()
+        assert timeline.deadlines == [deadline]
+
+        timeline.advance(5 * 60)
+        _, _, other_watchdog = build(hass, other, connected=True)
+        other_watchdog.async_start()
+        timeline.advance(3 * 60)
+        other_watchdog.async_stop()
+        hass.data[DOMAIN].pop(other.entry_id)
+        asyncio.run(integration.async_remove_entry(hass, other))
+
+        assert timeline.deadlines == [deadline]
+        timeline.advance(7 * 60)
+        assert set(issues(hass)) == {(DOMAIN, ISSUE_ID)}
+
+
+class TestOutageClockSurvivesReloads:
+    """THE AUTOHEAL MEASUREMENT (live, 2026-09-09, during a deliberate
+    21-minute power cut of the sibling Fluval light — the fans sit behind the
+    same automation):
+
+        22:24:37  link drop       -> countdown armed
+        22:35:00  autoheal reload -> fresh watcher, countdown restarts at zero
+        22:40:00  autoheal reload -> fresh watcher, countdown restarts at zero
+
+    automation.ble_proxy_autoheal reloads the entry of any device whose link
+    is down every 5 minutes, for exactly as long as it is down, so a
+    countdown that lives in anything the entry owns can never reach 15
+    minutes.  The repair must appear 15 minutes after the FIRST drop.
+    """
+
+    def test_repair_is_raised_fifteen_minutes_after_the_first_drop(self, timeline):
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        device, _, watchdog = build(hass, entry, connected=True)
+        watchdog.async_start()
+        assert timeline.deadlines == []
+
+        drop(device)
+        deadline = timeline.now + UNREACHABLE_AFTER.total_seconds()
+        assert timeline.deadlines == [deadline]
+
+        for _reload in range(2):
+            timeline.advance(5 * 60)
+            _, _, watchdog = reload(hass, entry, watchdog, connected=False)
+            # The remaining window, not a fresh one.
+            assert timeline.deadlines == [deadline]
+            assert issues(hass) == {}
+
+        timeline.advance(5 * 60 - 1)
+        assert issues(hass) == {}
+        timeline.advance(1)
+        assert (DOMAIN, ISSUE_ID) in issues(hass)
+
+    def test_a_reload_after_the_threshold_raises_at_once(self, timeline):
+        """Reloaded with the outage already older than the window: no timer,
+        the repair is raised on the spot."""
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, _, watchdog = build(hass, entry, connected=False)
+        watchdog.async_start()
+        watchdog.async_stop()
+        hass.data[DOMAIN].pop(entry.entry_id)
+        assert timeline.deadlines == []
+
+        timeline.advance(UNREACHABLE_AFTER.total_seconds() + 60)
+        _, _, watchdog = build(hass, entry, connected=False)
+        watchdog.async_start()
+
+        assert (DOMAIN, ISSUE_ID) in issues(hass)
+        assert timeline.deadlines == []
+
+    def test_a_healthy_reload_forgets_the_outage(self, timeline):
+        """A fan that came back is judged afresh on its next drop."""
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        _, _, watchdog = build(hass, entry, connected=False)
+        watchdog.async_start()
+        timeline.advance(10 * 60)
+        device, _, watchdog = reload(hass, entry, watchdog, connected=True)
+        assert timeline.deadlines == []
+
+        timeline.advance(60)
+        drop(device)
+
+        assert timeline.deadlines == [timeline.now + UNREACHABLE_AFTER.total_seconds()]
+
+
+class TestSetupNotReady:
+    """Live on 2026-09-09: the living-room vent fan sat in setup_retry from
+    22:23:52 with "Could not find AC Infinity device with address
+    A4:C1:38:44:3D:49", its Connection sensor unavailable and NO repair —
+    async_setup_entry raises before the watchdog is even constructed, and
+    Home Assistant retries setup on a backoff forever.  The most total
+    outage there is must raise the repair like any other.
+    """
+
+    @staticmethod
+    def setup(hass: FakeHass, entry: FakeEntry) -> None:
+        with pytest.raises(ConfigEntryNotReady):
+            asyncio.run(integration.async_setup_entry(hass, entry))
+
+    def test_a_fan_that_never_advertises_gets_the_repair(self, timeline):
+        entry = FakeEntry("e1", "Living Room Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+
+        self.setup(hass, entry)
+        deadline = timeline.now + UNREACHABLE_AFTER.total_seconds()
+        assert timeline.deadlines == [deadline]
+
+        # Home Assistant's retry backoff: 10 s, 20 s, 40 s ... capped at
+        # 5 min. None of them may push the deadline out or stack timers.
+        for wait in (10, 20, 40, 80, 160, 300):
+            timeline.advance(wait)
+            self.setup(hass, entry)
+            assert timeline.deadlines == [deadline]
+            assert issues(hass) == {}
+
+        timeline.advance(deadline - timeline.now)
+
+        issue = issues(hass)[(DOMAIN, ISSUE_ID)]
+        assert issue["is_fixable"] is True
+        assert issue["translation_placeholders"]["name"] == "Living Room Vent Fan"
+
+    def test_a_retry_after_the_threshold_raises_at_once(self, timeline):
+        entry = FakeEntry("e1", "Living Room Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        self.setup(hass, entry)
+        # The deadline fires while the entry is not loaded, which is what
+        # setup_retry looks like from the outside.
+        timeline.advance(UNREACHABLE_AFTER.total_seconds())
+        assert (DOMAIN, ISSUE_ID) in issues(hass)
+        ir.async_delete_issue(hass, DOMAIN, ISSUE_ID)
+
+        timeline.advance(300)
+        self.setup(hass, entry)
+
+        assert (DOMAIN, ISSUE_ID) in issues(hass)
+        assert timeline.deadlines == []
+
+    def test_a_fan_found_on_a_later_retry_is_judged_by_its_link(self, timeline):
+        """Setup eventually succeeds: the watchdog takes over the SAME clock,
+        so a fan that is found but still will not connect is flagged 15
+        minutes after it first went missing, and one that connects is not."""
+        entry = FakeEntry("e1", "Living Room Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        self.setup(hass, entry)
+        deadline = timeline.now + UNREACHABLE_AFTER.total_seconds()
+
+        timeline.advance(10 * 60)
+        device, _, watchdog = build(hass, entry, connected=False)
+        watchdog.async_start()
+        assert timeline.deadlines == [deadline]
+
+        reconnect(device)
+        assert timeline.deadlines == []
+        timeline.advance(10 * 60)
+        assert issues(hass) == {}
+
+    def test_an_entry_disabled_while_retrying_is_left_alone(self, timeline):
+        """Disabling a setup_retry entry runs no unload hook of ours, so the
+        pending deadline is the only thing left that could raise a repair
+        for a fan the operator has deliberately switched off."""
+        entry = FakeEntry("e1", "Living Room Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        self.setup(hass, entry)
+
+        entry.disabled_by = "user"
+        entry.state = ConfigEntryState.NOT_LOADED
+        timeline.advance(UNREACHABLE_AFTER.total_seconds())
+
+        assert issues(hass) == {}
 
 
 def hold_through(monkeypatch, scanner) -> list:

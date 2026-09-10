@@ -32,7 +32,11 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import partial
+from time import monotonic
+from typing import TYPE_CHECKING
 
 from bleak.backends.device import BLEDevice
 from habluetooth import HaBluetoothSlotAllocations, get_manager
@@ -55,6 +59,9 @@ from .ac_infinity_ble.models import DeviceInfo
 from .const import CONF_LAST_HOLDING_PROXY, DOMAIN
 from .device import ACInfinityDevice
 from .hold import allocation_source_for_address
+
+if TYPE_CHECKING:
+    from .models import ACInfinityData
 
 DEVICE_STARTUP_TIMEOUT = 30
 
@@ -165,6 +172,141 @@ def unreachable_issue_id(address: str) -> str:
     entry being removed and re-added.
     """
     return f"{address.upper().replace(':', '')}_unreachable"
+
+
+# hass.data[DOMAIN] key of the per-address outage clocks.  Deliberately NOT
+# on the watchdog, the coordinator or the entry's runtime data: measured live
+# on 2026-09-09 during a deliberate 21-minute power cut of the sibling Fluval
+# light (the fans sit behind the same automation), automation.ble_proxy_autoheal
+# reloads the config entry of any device whose link is down every 5 minutes,
+# for exactly as long as it is down:
+#
+#     22:24:37  link drop       -> countdown armed
+#     22:35:00  autoheal reload -> fresh watcher, countdown restarts at zero
+#     22:40:00  autoheal reload -> fresh watcher, countdown restarts at zero
+#
+# Anything the entry owns dies with it on every reload, so a countdown kept
+# there could never reach 15 minutes.  This mapping outlives every reload
+# (async_unload_entry pops only its own entry id from hass.data[DOMAIN]) and
+# an entry that cannot even be set up; it is forgotten only by a healthy
+# observation or by the entry being removed.  A Home Assistant restart drops
+# it, and then a fresh countdown is the honest answer.
+LINK_OUTAGES_KEY = "_link_outages"
+
+
+@dataclass(slots=True)
+class LinkOutage:
+    """One address's current outage: when it began, and the pending deadline."""
+
+    down_since: float  # monotonic()
+    cancel_deadline: CALLBACK_TYPE | None = None
+
+
+def _link_outages(hass: HomeAssistant) -> dict[str, LinkOutage]:
+    return hass.data.setdefault(DOMAIN, {}).setdefault(LINK_OUTAGES_KEY, {})
+
+
+@callback
+def async_link_down(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """The link to ``entry``'s fan is down right now; keep the repair honest.
+
+    Starts the outage clock on the first unhealthy observation — and ONLY
+    then, so a reload cannot restart it — then either raises the repair on
+    the spot when the outage already spans the threshold, or makes sure one
+    deadline is pending for the REMAINING window.  Idempotent by design:
+    Home Assistant retries a not-ready setup on a backoff and the watchdog
+    reconciles on every link event, and neither may push the deadline out
+    or stack a second timer.
+
+    Two callers, one clock: the watchdog of a loaded entry, and
+    async_setup_entry at the point where it gives up because the fan cannot
+    be found (the living-room vent fan sat in setup_retry from 22:23 on
+    2026-09-09 with no watchdog and therefore no repair).
+    """
+    address = entry.data[CONF_ADDRESS].upper()
+    outages = _link_outages(hass)
+    now = monotonic()
+    if (outage := outages.get(address)) is None:
+        outage = outages[address] = LinkOutage(down_since=now)
+    remaining = UNREACHABLE_AFTER - timedelta(seconds=now - outage.down_since)
+    if remaining <= timedelta(0):
+        async_create_unreachable_issue(hass, entry)
+        return
+    if outage.cancel_deadline is None:
+        outage.cancel_deadline = async_call_later(
+            hass, remaining, partial(_async_outage_deadline, hass, address)
+        )
+
+
+@callback
+def async_clear_outage(hass: HomeAssistant, address: str) -> None:
+    """Forget ``address``'s outage: the link is healthy, or the entry is gone."""
+    outage = _link_outages(hass).pop(address.upper(), None)
+    if outage is not None and outage.cancel_deadline is not None:
+        outage.cancel_deadline()
+
+
+@callback
+def async_cancel_outage_deadline(hass: HomeAssistant, address: str) -> None:
+    """Cancel the pending deadline but keep the clock running (entry unload).
+
+    Whatever sets the entry up next — the watchdog, or the not-ready path —
+    re-arms it for what is left of the window.
+    """
+    outage = _link_outages(hass).get(address.upper())
+    if outage is not None and outage.cancel_deadline is not None:
+        outage.cancel_deadline()
+        outage.cancel_deadline = None
+
+
+@callback
+def _async_outage_deadline(hass: HomeAssistant, address: str, _now: datetime) -> None:
+    """The outage has spanned the threshold; judge it against LIVE state.
+
+    Scheduled on hass, not through the entry, because the not-ready path
+    arms it from a setup that never gets to register an unload hook — so
+    nothing about the entry can be assumed to still be true when it fires.
+    """
+    outage = _link_outages(hass).get(address)
+    if outage is None:
+        return
+    outage.cancel_deadline = None
+    entry = next(
+        (
+            candidate
+            for candidate in hass.config_entries.async_entries(DOMAIN)
+            if candidate.data[CONF_ADDRESS].upper() == address
+        ),
+        None,
+    )
+    # Disabling a setup_retry entry runs no unload hook of ours; this is the
+    # only place that can notice the operator switched the fan off.
+    if entry is None or entry.disabled_by is not None:
+        return
+    data: ACInfinityData | None = hass.data[DOMAIN].get(entry.entry_id)
+    if data is not None:
+        # Loaded: the watchdog judges the link, so a fan that came back
+        # without anyone noticing is cleared rather than flagged.
+        data.watchdog.async_link_changed()
+        return
+    # Not loaded: setup has failed to find the fan for the whole window.
+    async_link_down(hass, entry)
+
+
+@callback
+def async_create_unreachable_issue(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        unreachable_issue_id(entry.data[CONF_ADDRESS]),
+        is_fixable=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="device_unreachable",
+        translation_placeholders={
+            "name": entry.title,
+            "minutes": str(int(UNREACHABLE_AFTER.total_seconds() // 60)),
+        },
+    )
 
 
 class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]):
@@ -441,9 +583,11 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
 class ACInfinityLinkWatchdog:
     """Keeps the ``device_unreachable`` repair in sync with one fan's link.
 
-    One instance per config entry: six fans share this code, so the issue id,
-    the 15-minute timer and the remembered proxy all belong to the entry, not
-    to the module.
+    One instance per config entry: six fans share this code, so the issue id
+    and the remembered proxy belong to the entry, not to the module.  The
+    outage clock and its deadline do NOT belong to the entry — see
+    LINK_OUTAGES_KEY for the measurement that decided this; the watchdog only
+    drives them through async_link_down / async_clear_outage.
 
     THE RULE THIS CLASS EXISTS TO ENFORCE (learned the hard way in the
     sibling fluvalble integration on 2026-09-09: an issue raised at 12:22 was
@@ -469,7 +613,6 @@ class ACInfinityLinkWatchdog:
         self.address: str = entry.data[CONF_ADDRESS].upper()
         self.issue_id = unreachable_issue_id(self.address)
         self._unsubscribes: list[CALLBACK_TYPE] = []
-        self._cancel_deadline: CALLBACK_TYPE | None = None
         self._deadline_passed = False
 
     @callback
@@ -498,11 +641,13 @@ class ACInfinityLinkWatchdog:
             lambda: self.coordinator.async_set_health_listener(None)
         )
         # Reality, not remembered state: an issue that outlived a reload means
-        # the deadline already passed once, so the countdown must not restart
-        # from zero (which would let a genuinely dead fan's issue be re-armed
-        # forever by a reload loop). A Home Assistant restart drops the issue
-        # (is_persistent=False), and then a fresh countdown is the honest
-        # answer, because nothing knows how long the link was down.
+        # the deadline already passed once, so it must not be re-armed (which
+        # would let a genuinely dead fan's issue be re-armed forever by a
+        # reload loop).  The outage clock is the primary source of "how long"
+        # and already survives reloads; this covers the issue itself.  A Home
+        # Assistant restart drops both (is_persistent=False), and then a fresh
+        # countdown is the honest answer, because nothing knows how long the
+        # link was down.
         self._deadline_passed = (
             ir.async_get(self.hass).async_get_issue(DOMAIN, self.issue_id) is not None
         )
@@ -510,10 +655,14 @@ class ACInfinityLinkWatchdog:
 
     @callback
     def async_stop(self) -> None:
-        """Unsubscribe and cancel the pending deadline (unload/reload)."""
+        """Unsubscribe and cancel the pending deadline (unload/reload).
+
+        The deadline only: the outage clock keeps running, and whatever sets
+        this entry up next arms a deadline for what is left of the window.
+        """
         while self._unsubscribes:
             self._unsubscribes.pop()()
-        self._async_cancel_deadline()
+        async_cancel_outage_deadline(self.hass, self.address)
 
     @callback
     def async_link_changed(self) -> None:
@@ -522,46 +671,15 @@ class ACInfinityLinkWatchdog:
         Unconditional in both directions on purpose — see the class docstring.
         """
         if self.coordinator.link_healthy:
-            self._async_cancel_deadline()
+            async_clear_outage(self.hass, self.address)
             self._deadline_passed = False
             self._async_remember_proxy()
             ir.async_delete_issue(self.hass, DOMAIN, self.issue_id)
             return
         if self._deadline_passed:
-            self._async_create_issue()
+            async_create_unreachable_issue(self.hass, self.entry)
             return
-        if self._cancel_deadline is None:
-            self._cancel_deadline = async_call_later(
-                self.hass, UNREACHABLE_AFTER, self._async_deadline_reached
-            )
-
-    @callback
-    def _async_deadline_reached(self, _now: datetime) -> None:
-        """Handle the link having been down for the whole threshold."""
-        self._cancel_deadline = None
-        self._deadline_passed = True
-        self.async_link_changed()
-
-    @callback
-    def _async_cancel_deadline(self) -> None:
-        if self._cancel_deadline is not None:
-            self._cancel_deadline()
-            self._cancel_deadline = None
-
-    @callback
-    def _async_create_issue(self) -> None:
-        ir.async_create_issue(
-            self.hass,
-            DOMAIN,
-            self.issue_id,
-            is_fixable=True,
-            severity=ir.IssueSeverity.WARNING,
-            translation_key="device_unreachable",
-            translation_placeholders={
-                "name": self.entry.title,
-                "minutes": str(int(UNREACHABLE_AFTER.total_seconds() // 60)),
-            },
-        )
+        async_link_down(self.hass, self.entry)
 
     @callback
     def _async_allocations_changed(

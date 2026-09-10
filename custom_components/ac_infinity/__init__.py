@@ -26,7 +26,9 @@ from .coordinator import (
     DEVICE_STARTUP_TIMEOUT,
     ACInfinityDataUpdateCoordinator,
     ACInfinityLinkWatchdog,
+    async_clear_outage,
     async_holding_scanner_name,
+    async_link_down,
     unreachable_issue_id,
 )
 from .device import ACInfinityDevice, AutoModeConfig, DeviceInfoEx
@@ -85,6 +87,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     address: str = entry.data[CONF_ADDRESS]
     ble_device = bluetooth.async_ble_device_from_address(hass, address.upper(), True)
     if not ble_device:
+        # The most total outage there is, and the one the watchdog below can
+        # never see: it is constructed after this raise, and Home Assistant
+        # retries setup on a backoff for as long as the fan stays missing.
+        # Live on 2026-09-09 the living-room vent fan sat in setup_retry from
+        # 22:23:52 with exactly this reason, its Connection sensor
+        # unavailable and no repair.  So the outage clock is recorded and
+        # the deadline armed here, before the raise; async_link_down is
+        # idempotent per address, so the retries cannot push the deadline
+        # out, and its timer is scheduled on hass rather than through
+        # entry.async_on_unload, which a failed setup never gets to keep.
+        async_link_down(hass, entry)
         raise ConfigEntryNotReady(
             f"Could not find AC Infinity device with address {address}"
         )
@@ -123,6 +136,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not await coordinator.async_wait_ready():
         if not hold:
+            # Same outage, one step later: found once, silent since.
+            async_link_down(hass, entry)
             raise ConfigEntryNotReady(
                 f"{entry.title} ({address}) is not advertising state; "
                 "check ESPHome proxy coverage"
@@ -212,12 +227,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Retire this fan's repair issue when its entry is deleted.
+    """Retire this fan's repair issue and outage clock when its entry is deleted.
 
-    Unload deliberately leaves the issue alone (a reload must not clear a
-    genuine fault), but a removed entry means the fan is gone: nothing would
-    ever reconcile the issue again, and its Fix button could only abort.
+    Unload deliberately leaves both alone (a reload must not clear a genuine
+    fault, and the clock is what makes the 15-minute threshold reachable
+    across reloads), but a removed entry means the fan is gone: nothing
+    would ever reconcile the issue again, its Fix button could only abort,
+    and a deadline left pending would raise it once more.
     """
-    ir.async_delete_issue(
-        hass, DOMAIN, unreachable_issue_id(entry.data[CONF_ADDRESS])
-    )
+    address: str = entry.data[CONF_ADDRESS]
+    async_clear_outage(hass, address)
+    ir.async_delete_issue(hass, DOMAIN, unreachable_issue_id(address))

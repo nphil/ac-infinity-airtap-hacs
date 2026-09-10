@@ -688,10 +688,13 @@ def install() -> bool:
     def async_call_later(hass, delay, action):
         """Record the timer instead of arming a real one.
 
-        Tests fire the recorded action to simulate the delay elapsing, which
-        is the only way to exercise a 15-minute threshold without waiting;
-        cancelling must actually remove it, because "the timer was cancelled
-        on reconnect" is part of the contract.
+        Nothing in the integration may arm a real timer under pytest, and
+        cancelling must actually remove the record, because "the timer was
+        cancelled on reconnect" is part of the contract.  tests/test_repairs.py
+        replaces this with its Timeline, which fires a timer only once a
+        patched monotonic clock reaches its deadline — the 15-minute threshold
+        has to be measured from the first drop, not from whenever a test
+        chooses to fire whatever is recorded.
         """
         timers = getattr(hass, "pending_timers", None)
         if timers is None:
