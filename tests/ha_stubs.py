@@ -160,12 +160,19 @@ def install() -> bool:
     class HomeAssistant:
         pass
 
+    class ServiceCall:
+        """Only what the release_link handler reads: `data`."""
+
+        def __init__(self, data=None):
+            self.data = data or {}
+
     class CoreState(Enum):
         running = "RUNNING"
         not_running = "NOT_RUNNING"
 
     core.callback = callback
     core.HomeAssistant = HomeAssistant
+    core.ServiceCall = ServiceCall
     core.CoreState = CoreState
     core.CALLBACK_TYPE = Callable[[], None]
 

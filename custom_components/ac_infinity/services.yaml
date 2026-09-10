@@ -1,0 +1,15 @@
+release_link:
+  # Home Assistant does not unload config entries on shutdown, so a restart
+  # drops held GATT links without completing a disconnect. The fan keeps
+  # believing it is connected, stops advertising, and only a proxy reboot
+  # frees it. Call this first, then restart.
+  fields:
+    resume_after:
+      required: false
+      default: 180
+      selector:
+        number:
+          min: 0
+          max: 900
+          unit_of_measurement: seconds
+          mode: box

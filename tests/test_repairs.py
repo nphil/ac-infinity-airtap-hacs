@@ -21,6 +21,7 @@ threshold can be reached without waiting for it.
 
 import asyncio
 import contextlib
+import inspect
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -102,7 +103,11 @@ class FakeConfigEntries:
 
 
 class FakeServices:
-    """Faithful to the two ServiceRegistry members the wizard uses."""
+    """Faithful to the ServiceRegistry members the integration uses.
+
+    `async_register` exists because entry setup registers the domain's
+    `release_link` action; the wizard itself only reads `has_service`.
+    """
 
     def __init__(self, services: dict | None = None) -> None:
         self._services = services or {}
@@ -118,6 +123,9 @@ class FakeServices:
         if (domain, service) in self.fail:
             self.fail.discard((domain, service))
             raise HomeAssistantError(f"{domain}.{service} unavailable")
+
+    def async_register(self, domain, service, handler, schema=None):
+        self._services.setdefault(domain, {})[service] = handler
 
 
 class FakeHass:
@@ -142,6 +150,8 @@ class Timeline:
         self.timers: list[tuple[float, Callable]] = []
         monkeypatch.setattr(coordinator_module, "monotonic", lambda: self.now)
         monkeypatch.setattr(coordinator_module, "async_call_later", self._call_later)
+        # release_link arms its resume timer from the integration module.
+        monkeypatch.setattr(integration, "async_call_later", self._call_later)
 
     def _call_later(self, hass, delay, action):
         seconds = delay.total_seconds() if isinstance(delay, timedelta) else delay
@@ -169,7 +179,12 @@ class Timeline:
         while due := sorted(t for t in self.timers if t[0] <= self.now):
             for timer in due:
                 self.timers.remove(timer)
-                timer[1](datetime.now(timezone.utc))
+                result = timer[1](datetime.now(timezone.utc))
+                # Real async_call_later accepts a coroutine function and runs
+                # it as a HassJob; a fake that only called it would silently
+                # drop the work and every assertion after it would be vacuous.
+                if inspect.iscoroutine(result):
+                    asyncio.run(result)
 
 
 THRESHOLD = UNREACHABLE_AFTER.total_seconds()
@@ -970,3 +985,48 @@ class TestOptionsBookkeeping:
             CONF_LAST_HOLDING_PROXY: PROXY,
             CONF_RECOVERY_OUTLET: "switch.tent_outlet",
         }
+
+
+class TestReleaseLink:
+    """The pre-restart teardown: the whole point is that it completes.
+
+    Home Assistant does not unload entries on shutdown, so a restart drops
+    held links without a finished disconnect and the fan is left believing it
+    is still connected (measured 2026-09-09: the living-room fan wedged four
+    minutes after a restart and only a proxy reboot freed it).
+    """
+
+    def test_releasing_stops_the_hold_on_every_configured_fan(self):
+        entry_a = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        entry_b = FakeEntry("e2", "Other Vent Fan", "A4:C1:38:00:00:02")
+        hass = FakeHass(entry_a, entry_b)
+        device_a, _c, _w = build(hass, entry_a, connected=True)
+        device_b, _c2, _w2 = build(hass, entry_b, connected=True)
+
+        asyncio.run(integration._async_release_links(hass, resume_after=0))
+
+        # Observable result: neither device is holding a link any more.
+        assert device_a.hold_status.hold is False
+        assert device_b.hold_status.hold is False
+
+    def test_a_restart_that_never_comes_rebuilds_the_hold(self, timeline):
+        # Guards the operator who calls this and then changes their mind: a
+        # fan left disconnected would raise its own unreachable repair in 15
+        # minutes, which would be a worse bug than the one being prevented.
+        entry = FakeEntry("e1", "Tent Vent Fan", ADDRESS)
+        hass = FakeHass(entry)
+        device, _c, _w = build(hass, entry, connected=True)
+
+        asyncio.run(integration._async_release_links(hass, resume_after=180))
+        assert device.hold_status.hold is False
+        assert timeline.remaining == [180.0]
+
+        timeline.advance(180)
+
+        assert device.hold_status.hold is True
+
+    def test_releasing_is_safe_when_nothing_is_loaded(self):
+        # Called during a restart sequence, entries may already be gone.
+        hass = FakeHass(FakeEntry("e1", "Tent Vent Fan", ADDRESS))
+
+        asyncio.run(integration._async_release_links(hass, resume_after=180))

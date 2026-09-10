@@ -13,12 +13,15 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+import voluptuous as vol
+
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_SERVICE_DATA, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.event import async_call_later
 
 from .ac_infinity_ble import DeviceInfo
 from .const import CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION, DOMAIN
@@ -84,6 +87,7 @@ def _device_info_from_entry_data(service_data: Any) -> DeviceInfoEx:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up AC Infinity from a config entry."""
+    _async_register_services(hass)
     address: str = entry.data[CONF_ADDRESS]
     ble_device = bluetooth.async_ble_device_from_address(hass, address.upper(), True)
     if not ble_device:
@@ -238,3 +242,95 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     address: str = entry.data[CONF_ADDRESS]
     async_clear_outage(hass, address)
     ir.async_delete_issue(hass, DOMAIN, unreachable_issue_id(address))
+
+
+# ---------------------------------------------------------------------------
+# release_link - a clean teardown before a Home Assistant restart
+# ---------------------------------------------------------------------------
+#
+# Home Assistant does NOT unload config entries on shutdown: it fires
+# EVENT_HOMEASSISTANT_STOP and the `bluetooth` integration tears its stack down
+# concurrently with everything else. Measured on 2026-09-09 at 23:21 local, the
+# shutdown log reads
+#
+#     D-YHN4F / D-4F668 / D-6LB2N / D-NN8P7: "Device unexpectedly disconnected"
+#     bleak.exc.BleakError: Bluetooth is already shutdown
+#
+# so the GATT disconnects never complete. The ESP keeps the ACL, the fan keeps
+# believing it is connected, and it stops advertising - a ghost link nothing on
+# the Home Assistant side can see or clear (the proxy reports its slots free).
+# The living-room fan wedged exactly four minutes after that restart and only a
+# proxy reboot freed it.
+#
+# The ordering inside HA's shutdown cannot be fixed from outside, so the
+# teardown has to happen BEFORE the restart is requested. This action does that
+# for every loaded entry, and re-arms the hold afterwards so an operator who
+# calls it and then does not restart - or a restart that fails - is not left
+# with disconnected fans.
+SERVICE_RELEASE_LINK = "release_link"
+ATTR_RESUME_AFTER = "resume_after"
+#: Seconds before the hold is rebuilt if no restart took the process away.
+#: Long enough for `homeassistant.restart` to actually stop the process,
+#: short enough that a mistaken call heals itself well inside the
+#: 15-minute unreachable window.
+DEFAULT_RESUME_AFTER = 180
+RELEASE_LINK_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_RESUME_AFTER, default=DEFAULT_RESUME_AFTER): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=900)
+        )
+    }
+)
+
+
+async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
+    """Drop every held GATT link cleanly, then re-arm the holds."""
+    released: list[tuple[ConfigEntry, ACInfinityData]] = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        data: ACInfinityData | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        if data is None:
+            continue
+        # Stop the supervisor first, exactly as async_unload_entry does: a
+        # teardown underneath a live supervisor looks like a lost link and it
+        # immediately rebuilds the connection we are releasing.
+        with contextlib.suppress(Exception):
+            await data.device.async_stop_hold()
+        with contextlib.suppress(Exception):
+            await data.device.stop()
+        released.append((entry, data))
+        _LOGGER.info("Released the BLE link held for %s", entry.title)
+
+    if not released or resume_after <= 0:
+        return
+
+    async def _resume(_now: Any) -> None:
+        """Rebuild the holds, for the restart that never came."""
+        for entry, data in released:
+            if entry.entry_id not in hass.data.get(DOMAIN, {}):
+                continue  # unloaded or reloaded meanwhile; it owns itself now
+            if not entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION):
+                continue
+            address: str = entry.data[CONF_ADDRESS]
+            with contextlib.suppress(Exception):
+                data.device.async_start_hold(
+                    lambda addr=address: async_holding_scanner_name(hass, addr.upper())
+                )
+        _LOGGER.info(
+            "No restart followed release_link within %s s; holds re-armed", resume_after
+        )
+
+    async_call_later(hass, resume_after, _resume)
+
+
+@callback
+def _async_register_services(hass: HomeAssistant) -> None:
+    """Register the domain action once, however many fans are configured."""
+    if hass.services.has_service(DOMAIN, SERVICE_RELEASE_LINK):
+        return
+
+    async def _handle(call: ServiceCall) -> None:
+        await _async_release_links(hass, call.data[ATTR_RESUME_AFTER])
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_RELEASE_LINK, _handle, schema=RELEASE_LINK_SCHEMA
+    )

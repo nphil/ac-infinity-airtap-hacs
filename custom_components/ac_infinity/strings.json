@@ -70,5 +70,17 @@
         }
       }
     }
+  },
+  "services": {
+    "release_link": {
+      "name": "Release link",
+      "description": "Cleanly drops the Bluetooth link this integration holds to every configured fan, then re-establishes it after a delay. Call this immediately before restarting Home Assistant: Home Assistant tears its Bluetooth stack down while integrations are still releasing, so a restart leaves the fan believing it is still connected and it stops advertising until its proxy is rebooted.",
+      "fields": {
+        "resume_after": {
+          "name": "Resume after",
+          "description": "Seconds to wait before rebuilding the link if Home Assistant is still running. Protects against a restart that never happens; 0 leaves the link released."
+        }
+      }
+    }
   }
 }
