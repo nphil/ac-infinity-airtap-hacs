@@ -317,7 +317,7 @@ def async_create_unreachable_issue(hass: HomeAssistant, entry: ConfigEntry) -> N
         hass,
         DOMAIN,
         unreachable_issue_id(entry.data[CONF_ADDRESS]),
-        is_fixable=True,
+        is_fixable=False,
         severity=ir.IssueSeverity.WARNING,
         translation_key="device_unreachable",
         translation_placeholders={
