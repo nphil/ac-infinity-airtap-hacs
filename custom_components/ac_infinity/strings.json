@@ -22,13 +22,22 @@
   "options": {
     "step": {
       "init": {
-        "title": "Hold Bluetooth connection",
+        "title": "Bluetooth connection",
         "data": {
-          "hold_connection": "Hold Bluetooth connection"
+          "hold_connection": "Hold Bluetooth connection",
+          "preferred_proxy": "Preferred proxy"
         },
         "data_description": {
-          "hold_connection": "Keep the Bluetooth connection to this fan open permanently, so commands respond in about 0.2 s instead of waiting 2-6 s for a fresh connection. While held, the fan occupies one of the three connection slots on whichever ESPHome Bluetooth proxy carries it, and the AC Infinity phone app cannot connect to the fan. Turn this off to go back to connecting only for each command and poll."
+          "hold_connection": "Keep the Bluetooth connection to this fan open permanently, so commands respond in about 0.2 s instead of waiting 2-6 s for a fresh connection. While held, the fan occupies one of the three connection slots on whichever ESPHome Bluetooth proxy carries it, and the AC Infinity phone app cannot connect to the fan. Turn this off to go back to connecting only for each command and poll.",
+          "preferred_proxy": "Route this fan's Bluetooth connection through one named ESPHome proxy whenever it can see the fan, instead of whichever proxy Home Assistant's signal-strength scorer would otherwise pick on every reconnect. Falls back to that normal routing after a few failed attempts through the named proxy, so a proxy that goes offline never strands the fan. Automatic (the default) leaves routing entirely to Home Assistant."
         }
+      }
+    }
+  },
+  "selector": {
+    "preferred_proxy": {
+      "options": {
+        "": "Automatic (strongest signal)"
       }
     }
   },

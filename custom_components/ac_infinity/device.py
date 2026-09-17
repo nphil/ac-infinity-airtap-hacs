@@ -22,6 +22,7 @@ from typing import Optional
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+from bleak_retry_connector import BleakClientWithServiceCache
 
 from .ac_infinity_ble import ACInfinityController, DeviceInfo
 from .ac_infinity_ble.const import CallbackType
@@ -147,11 +148,13 @@ class ACInfinityDevice(ACInfinityController):
         ble_device: BLEDevice,
         state: DeviceInfoEx | None = None,
         advertisement_data: AdvertisementData | None = None,
+        client_class: type = BleakClientWithServiceCache,
     ):
         super().__init__(
             ble_device=ble_device,
             state=state,
             advertisement_data=advertisement_data,
+            client_class=client_class,
         )
 
         # When constructed from advertisement_data alone (config flow path),

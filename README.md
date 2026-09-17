@@ -41,15 +41,24 @@ provably speaks today. No guessed commands are ever sent to the hardware.
   blocks the AC Infinity phone app while held; after a drop it reconnects with
   backoff, roaming to whichever proxy Home Assistant scores best at that
   moment. Turn it off per fan in the integration's *Configure* dialog.
+- **Preferred proxy** (option, automatic by default) — pin a fan's held
+  connection to one named ESPHome proxy (its node name) instead of letting
+  Home Assistant's signal-strength scorer repick on every reconnect. Ghost
+  links form on marginal connections to a *distant* proxy; a fan that
+  always reconnects through the proxy next to it does not get into that
+  state. Falls back to normal routing after 3 consecutive failed attempts
+  through the named proxy (habluetooth's own failure counter, which resets
+  on the next success), so a proxy that goes offline never strands the fan.
+  Set per fan in the integration's *Configure* dialog.
 - **Genuine availability** — entities go unavailable when no Bluetooth
   scanner/proxy has seen the fan for the tracked interval, and recover on
   the first frame seen again; a fan on a live held connection always counts
   as available.
 - **Diagnostics** — a **Connection** sensor naming the proxy that currently
-  carries the link (`disconnected` when there is none), with drop counts and
-  the reconnect attempt as attributes; plus a download from the device page:
-  advertisement age, RSSI, which proxy last saw the fan, connection stats,
-  full (address-redacted) device state.
+  carries the link (`disconnected` when there is none), with drop counts,
+  the reconnect attempt, and the preferred-proxy choice as attributes; plus
+  a download from the device page: advertisement age, RSSI, which proxy
+  last saw the fan, connection stats, full (address-redacted) device state.
 - **Recovery repair** — when a fan's own Bluetooth link has been down for 15
   minutes straight, a repair appears under *Settings → System → Repairs*
   whose Fix button walks up an escalation ladder: check again, reload the

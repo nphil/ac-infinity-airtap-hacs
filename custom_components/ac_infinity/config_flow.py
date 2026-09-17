@@ -11,20 +11,24 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
 from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
 from homeassistant.const import CONF_ADDRESS, CONF_SERVICE_DATA
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import selector
 
 from .ac_infinity_ble.const import MANUFACTURER_ID
 from .ac_infinity_ble.protocol import parse_manufacturer_data as _parse_vendored
 from .const import (
     BLEAK_EXCEPTIONS,
     CONF_HOLD_CONNECTION,
+    CONF_PREFERRED_PROXY,
     DEFAULT_HOLD_CONNECTION,
+    DEFAULT_PREFERRED_PROXY,
     DOMAIN,
 )
 from .device import ACInfinityDevice, DeviceInfoEx
@@ -180,6 +184,23 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
+def _preferred_proxy_choices(hass: HomeAssistant, current: str) -> list[str]:
+    """Node names of connectable scanners right now, plus ``current``.
+
+    ``current`` (the entry's already-configured value) is included even
+    when no live scanner reports it, so a proxy that is temporarily offline
+    is never silently dropped from a choice the operator already made.
+    """
+    names = {
+        scanner.adapter
+        for scanner in bluetooth.async_current_scanners(hass)
+        if scanner.connectable and getattr(scanner, "adapter", None)
+    }
+    if current:
+        names.add(current)
+    return [DEFAULT_PREFERRED_PROXY, *sorted(names)]
+
+
 class OptionsFlowHandler(config_entries.OptionsFlow):
     """Per-fan tunables.
 
@@ -202,6 +223,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 data={**self.config_entry.options, **user_input}
             )
 
+        preferred_proxy = self.config_entry.options.get(
+            CONF_PREFERRED_PROXY, DEFAULT_PREFERRED_PROXY
+        )
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
@@ -212,6 +236,18 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                             CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION
                         ),
                     ): bool,
+                    vol.Required(
+                        CONF_PREFERRED_PROXY, default=preferred_proxy
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=_preferred_proxy_choices(
+                                self.hass, preferred_proxy
+                            ),
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                            custom_value=True,
+                            translation_key=CONF_PREFERRED_PROXY,
+                        )
+                    ),
                 }
             ),
         )

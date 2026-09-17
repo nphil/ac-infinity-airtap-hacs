@@ -16,6 +16,17 @@ BLEAK_EXCEPTIONS = (AttributeError, BleakError, TimeoutError)
 CONF_HOLD_CONNECTION = "hold_connection"
 DEFAULT_HOLD_CONNECTION = True
 
+# Per-entry option: prefer routing this fan's GATT connections through one
+# named ESPHome proxy (its node name, i.e. habluetooth's `scanner.adapter` -
+# the same identity CONF_LAST_HOLDING_PROXY records) instead of whichever
+# scanner Home Assistant's own RSSI-based scorer picks on every reconnect.
+# Falls back to that default routing after a bounded run of failures through
+# the named proxy; see ble_affinity.py for the mechanism and why it exists.
+# Empty string (the default) means automatic: no preference, today's
+# behavior unchanged.
+CONF_PREFERRED_PROXY = "preferred_proxy"
+DEFAULT_PREFERRED_PROXY = ""
+
 # Per-entry bookkeeping options. Written by the integration itself, never
 # offered in the options flow: the options flow must therefore merge rather
 # than replace, or one hold toggle would wipe both.

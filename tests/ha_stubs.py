@@ -338,6 +338,9 @@ def install() -> bool:
     def async_scanner_by_source(hass, source):
         return None
 
+    def async_current_scanners(hass):
+        return []
+
     bluetooth.BluetoothScanningMode = BluetoothScanningMode
     bluetooth.BluetoothChange = BluetoothChange
     bluetooth.BluetoothServiceInfoBleak = BluetoothServiceInfoBleak
@@ -345,6 +348,7 @@ def install() -> bool:
     bluetooth.async_ble_device_from_address = async_ble_device_from_address
     bluetooth.async_last_service_info = async_last_service_info
     bluetooth.async_scanner_by_source = async_scanner_by_source
+    bluetooth.async_current_scanners = async_current_scanners
 
     active_update_coordinator = _module(
         "homeassistant.components.bluetooth.active_update_coordinator"
@@ -768,6 +772,29 @@ def install() -> bool:
 
     selector.EntitySelector = EntitySelector
     selector.EntitySelectorConfig = EntitySelectorConfig
+
+    class SelectOptionDict(dict):
+        """HA models this as a TypedDict; a dict subclass is faithful enough."""
+
+    class SelectSelectorMode(StrEnum):
+        LIST = "list"
+        DROPDOWN = "dropdown"
+
+    class SelectSelectorConfig(dict):
+        """HA models this as a TypedDict; a dict subclass is faithful enough."""
+
+    class SelectSelector:
+        def __init__(self, config=None) -> None:
+            self.config = config or {}
+
+        def __call__(self, data):
+            # Real selectors are voluptuous-callable validators.
+            return data
+
+    selector.SelectOptionDict = SelectOptionDict
+    selector.SelectSelectorMode = SelectSelectorMode
+    selector.SelectSelectorConfig = SelectSelectorConfig
+    selector.SelectSelector = SelectSelector
 
     # homeassistant.util (+ percentage)
     util = _module("homeassistant.util")

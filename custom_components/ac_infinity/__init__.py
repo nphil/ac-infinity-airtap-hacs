@@ -13,6 +13,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+import bleak_retry_connector
 import voluptuous as vol
 
 from homeassistant.components import bluetooth
@@ -24,7 +25,13 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_call_later
 
 from .ac_infinity_ble import DeviceInfo
-from .const import CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION, DOMAIN
+from .ble_affinity import make_affinity_client_class
+from .const import (
+    CONF_HOLD_CONNECTION,
+    CONF_PREFERRED_PROXY,
+    DEFAULT_HOLD_CONNECTION,
+    DOMAIN,
+)
 from .coordinator import (
     DEVICE_STARTUP_TIMEOUT,
     ACInfinityDataUpdateCoordinator,
@@ -107,7 +114,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     device_info = _device_info_from_entry_data(entry.data[CONF_SERVICE_DATA])
-    device = ACInfinityDevice(ble_device, device_info)
+
+    def _on_proxy_choice(_scanner_name: str, preferred_used: bool) -> None:
+        device.hold_status.set_via_preferred_proxy(preferred_used)
+
+    # bleak_retry_connector.BleakClientWithServiceCache is monkeypatched by
+    # HA's bluetooth integration into a HaBleakClientWrapper subclass; read
+    # it off the module here (call time) instead of importing the name,
+    # which could bind the pre-patch class. Built once per device object -
+    # preferred_getter re-reads the live option on every connect, so an
+    # options change takes effect on the next reconnect without rebuilding
+    # this class.
+    client_class = make_affinity_client_class(
+        bleak_retry_connector.BleakClientWithServiceCache,
+        lambda: entry.options.get(CONF_PREFERRED_PROXY) or None,
+        on_choice=_on_proxy_choice,
+    )
+    device = ACInfinityDevice(ble_device, device_info, client_class=client_class)
+    device.hold_status.set_preferred_proxy(
+        entry.options.get(CONF_PREFERRED_PROXY) or None
+    )
     coordinator = ACInfinityDataUpdateCoordinator(hass, _LOGGER, ble_device, device)
 
     # Entries created before the option existed carry no options dict, so
@@ -183,19 +209,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry when — and only when — the hold setting changed.
+    """Reload the entry when the hold setting or preferred proxy changed.
 
     ``entry.options`` also carries bookkeeping the integration writes itself
     (CONF_LAST_HOLDING_PROXY on every proxy change, CONF_RECOVERY_OUTLET when
     the repair wizard learns an outlet).  Reloading for those would tear the
     held link down for no reason, and a fan roaming between two proxies would
     reload-loop: each reload reconnects, each reconnect writes the new proxy
-    name, which reloads again.  The live hold supervisor is the truth about
-    which setting this entry was actually set up with.
+    name, which reloads again.  The live device is the truth about which
+    hold setting and preferred proxy this entry was actually set up with.
     """
     data: ACInfinityData | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     hold = entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION)
-    if data is not None and bool(hold) == data.device.hold_status.hold:
+    preferred_proxy = entry.options.get(CONF_PREFERRED_PROXY) or None
+    if (
+        data is not None
+        and bool(hold) == data.device.hold_status.hold
+        and preferred_proxy == data.device.hold_status.preferred_proxy
+    ):
         return
     await hass.config_entries.async_reload(entry.entry_id)
 

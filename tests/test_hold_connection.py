@@ -458,6 +458,8 @@ class TestConnectionSensor:
             "drops_1h": 0,
             "last_drop": None,
             "reconnect_attempt": 0,
+            "preferred_proxy": None,
+            "via_preferred_proxy": False,
         }
 
     def test_reports_disconnected_with_the_drop_history(self, monkeypatch):

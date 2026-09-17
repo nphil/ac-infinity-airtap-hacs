@@ -155,11 +155,15 @@ class TestHoldStatusAttributes:
         status.set_hold(True)
         status.set_reconnect_attempt(3)
         status.record_drop()
+        status.set_preferred_proxy("plant-room-bluetooth-proxy")
+        status.set_via_preferred_proxy(True)
         assert status.as_attributes() == {
             "hold": True,
             "drops_1h": 1,
             "last_drop": clock.utcnow().isoformat(),
             "reconnect_attempt": 3,
+            "preferred_proxy": "plant-room-bluetooth-proxy",
+            "via_preferred_proxy": True,
         }
 
     def test_listeners_fire_on_change_only(self):

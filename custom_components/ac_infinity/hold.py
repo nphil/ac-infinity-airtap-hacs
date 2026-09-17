@@ -124,6 +124,8 @@ class HoldStatus:
         self._last_drop: datetime | None = None
         self._hold = False
         self._reconnect_attempt = 0
+        self._preferred_proxy: str | None = None
+        self._via_preferred_proxy = False
         self._listeners: list[Callable[[], None]] = []
 
     def add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
@@ -158,6 +160,26 @@ class HoldStatus:
     def set_reconnect_attempt(self, attempt: int) -> None:
         if self._reconnect_attempt != attempt:
             self._reconnect_attempt = attempt
+            self._notify()
+
+    @property
+    def preferred_proxy(self) -> str | None:
+        """The preferred-proxy option this device was set up with, if any."""
+        return self._preferred_proxy
+
+    def set_preferred_proxy(self, preferred_proxy: str | None) -> None:
+        if self._preferred_proxy != preferred_proxy:
+            self._preferred_proxy = preferred_proxy
+            self._notify()
+
+    @property
+    def via_preferred_proxy(self) -> bool:
+        """Whether the most recent connection was routed to the preferred proxy."""
+        return self._via_preferred_proxy
+
+    def set_via_preferred_proxy(self, via_preferred_proxy: bool) -> None:
+        if self._via_preferred_proxy != via_preferred_proxy:
+            self._via_preferred_proxy = via_preferred_proxy
             self._notify()
 
     def record_drop(self) -> None:
@@ -196,4 +218,6 @@ class HoldStatus:
             "drops_1h": self.drops_1h,
             "last_drop": self.last_drop,
             "reconnect_attempt": self._reconnect_attempt,
+            "preferred_proxy": self._preferred_proxy,
+            "via_preferred_proxy": self._via_preferred_proxy,
         }

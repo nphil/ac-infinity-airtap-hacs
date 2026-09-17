@@ -86,13 +86,22 @@ class ACInfinityController:
         ble_device: BLEDevice,
         state: DeviceInfo | None = None,
         advertisement_data: AdvertisementData | None = None,
+        client_class: type = BleakClientWithServiceCache,
     ) -> None:
-        """Init the ACInfinityController."""
+        """Init the ACInfinityController.
+
+        ``client_class`` is the class ``establish_connection`` builds the
+        GATT link with; overridable so a caller can inject a specialised
+        subclass (e.g. one with a preference for a specific scanner) without
+        this module knowing anything about how that specialisation works -
+        this file MUST stay a pure BLE library, no ``homeassistant`` imports.
+        """
         if not state and not advertisement_data:
             raise ValueError("Must provide either state or advertisement_data")
 
         self._ble_device = ble_device
         self._advertisement_data = advertisement_data
+        self._client_class = client_class
         self._operation_lock = asyncio.Lock()
         self._state = state or parse_manufacturer_data(
             advertisement_data.manufacturer_data[MANUFACTURER_ID]  # type: ignore
@@ -441,7 +450,7 @@ class ACInfinityController:
                 return
             _LOGGER.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
             client = await establish_connection(
-                BleakClientWithServiceCache,
+                self._client_class,
                 self._ble_device,
                 self.name,
                 self._disconnected,
