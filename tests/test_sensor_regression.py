@@ -67,11 +67,15 @@ class TestFanSpeedSensor:
 
 
 class TestTemperatureSensor:
-    """The device reports hundredths of a degree and re-advertises every ~2 s,
-    so publishing the raw value made every update a distinct state with its
-    own recorder row: measured 2026-09-18, the six vents' temperature sensors
-    held 48% of a 15-day, 7.2 M-row history. The published value is quantized
-    to 0.1 degC, which is finer than the sensor is accurate.
+    """These controllers re-advertise every ~2 s and the reading genuinely
+    wanders - measured live 2026-09-18, one vent swung 1.7 degC in ten minutes
+    with consecutive samples up to 0.9 degC apart - so every update was a
+    distinct state with its own recorder row: the six vents' temperature
+    sensors held 48% of a 15-day, 7.2 M-row history.
+
+    Rounding alone does not fix that at any grid size (a value sitting on a
+    boundary flaps between neighbours), and measurably did not: 27 rows/min
+    before, 26-36 after. The contract is whole degrees held inside a deadband.
     """
 
     @staticmethod
@@ -83,35 +87,51 @@ class TestTemperatureSensor:
         coordinator = SimpleNamespace(available=True)
         return TemperatureSensor(coordinator, device, "Temperature")
 
+    def feed(self, sensor, *readings):
+        """Deliver successive advertisements, collecting what was published."""
+        published = []
+        for reading in readings:
+            sensor._device.temperature = reading
+            push_update(sensor)
+            published.append(sensor.native_value)
+        return published
+
     @pytest.mark.parametrize(
         ("raw", "published"),
-        [(21.01, 21.0), (21.06, 21.1), (21.94, 21.9), (22.0, 22.0), (-3.55, -3.5)],
+        [(21.01, 21.0), (21.6, 22.0), (22.0, 22.0), (-3.4, -3.0)],
     )
-    def test_publishes_tenths(self, raw, published):
+    def test_first_reading_publishes_whole_degrees(self, raw, published):
         sensor = self.make(raw)
         push_update(sensor)
         assert sensor.native_value == pytest.approx(published)
 
-    def test_noise_within_a_tenth_does_not_change_state(self):
-        """THE regression: consecutive readings differing only in hundredths
-        must publish an unchanged value, or the recorder writes a row for
-        every advertisement."""
-        sensor = self.make(22.01)
+    def test_jitter_around_a_boundary_publishes_one_unchanged_value(self):
+        """THE regression: a reading wandering either side of x.5 must not
+        flap between two whole degrees - that flapping is the recorder flood.
+        """
+        sensor = self.make(22.4)
         push_update(sensor)
         first = sensor.native_value
-        for noisy in (22.02, 22.04, 21.97, 22.0):
-            sensor._device.temperature = noisy
-            push_update(sensor)
-            assert sensor.native_value == first
+        assert self.feed(sensor, 22.5, 22.6, 22.49, 22.51, 22.45) == [first] * 5
 
-    def test_real_movement_still_reported(self):
-        sensor = self.make(22.01)
+    def test_slow_drift_inside_the_deadband_holds_the_value(self):
+        sensor = self.make(22.0)
         push_update(sensor)
-        sensor._device.temperature = 22.31
+        assert self.feed(sensor, 22.3, 22.7, 21.4, 22.1) == [22.0] * 4
+
+    def test_real_movement_is_reported(self):
+        sensor = self.make(22.0)
         push_update(sensor)
-        assert sensor.native_value == pytest.approx(22.3)
+        assert self.feed(sensor, 22.9, 24.2) == [23.0, 24.0]
 
     def test_missing_reading_is_unknown_not_zero(self):
         sensor = self.make(None)
         push_update(sensor)
         assert sensor.native_value is None
+
+    def test_reading_after_unknown_is_treated_as_first(self):
+        """A value held across an outage would be deadbanded against a stale
+        reading, so the published value is forgotten when it goes unknown."""
+        sensor = self.make(22.0)
+        push_update(sensor)
+        assert self.feed(sensor, None, 22.4) == [None, 22.0]

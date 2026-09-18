@@ -22,6 +22,12 @@ from .fan import SPEED_RANGE
 from .hold import connection_state
 from .models import ACInfinityData
 
+# How far a raw reading must move from the value already published before a new
+# one is published. 0.8 comfortably exceeds the observed sample-to-sample
+# wander (up to 0.9 degC, but almost always far less) without hiding a real
+# change of a degree or more. See `quantize`.
+QUANTIZE_DEADBAND = 0.8
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -91,31 +97,52 @@ class ACInfinitySensor(
         super()._handle_coordinator_update()
 
 
+def quantize(raw: float | None, published: float | None) -> float | None:
+    """Publish whole units, holding the last value inside a deadband.
+
+    These controllers re-advertise every ~2 s and their readings genuinely
+    wander: measured on the live install 2026-09-18,
+    sensor.isabel_s_office_vent_fan_temperature swung 1.7 degC inside ten
+    minutes with consecutive samples up to 0.9 degC apart. It is a thermistor
+    in the airflow of a running fan, so most of that is real - not decode
+    noise - which is why the first attempt at this (rounding to 0.1 degC)
+    changed nothing: measured before 27 rows/min, after 26-36 rows/min.
+
+    Rounding ALONE cannot fix it at any grid size. A value wandering either
+    side of a boundary crosses it repeatedly, so a quantized reading flaps
+    between two neighbours and each flap is still a distinct state with its
+    own recorder row. The deadband is the part that actually works: a new
+    value is published only once the raw reading has moved far enough from
+    what is already published that it cannot be boundary jitter.
+
+    Cost: the published value can lag the true reading by up to DEADBAND.
+    For room air off a vent that is well inside the sensor's own accuracy,
+    and the raw value stays in `device.temperature`, so diagnostics keep it.
+    """
+    if raw is None:
+        # Unknown: forget the published value so the next real reading is
+        # treated as a first reading rather than deadbanded against a stale one.
+        return None
+    if published is None:
+        return float(round(raw))
+    if abs(raw - published) < QUANTIZE_DEADBAND:
+        return published
+    return float(round(raw))
+
+
 class TemperatureSensor(ACInfinitySensor):
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_suggested_display_precision = 1
+    # Whole degrees: the deadband already holds the value steady to about a
+    # degree, so decimals would only advertise precision that is not there.
+    _attr_suggested_display_precision = 0
 
     @callback
     def _update_attrs(self) -> None:
-        """Publish the temperature rounded to 0.1 degC.
-
-        The device reports hundredths of a degree (`get_short(data, 8) / 100`)
-        and re-advertises every ~2 s, so the last digit is thermistor noise
-        that never repeats: every single update was a distinct state and
-        earned its own recorder row. Measured 2026-09-18 on the live install,
-        the six vents' temperature sensors held 3.19 M of 7.23 M rows - 48% of
-        the entire 15-day history, ~427 MiB with attributes and indexes - at
-        one row per 2.2 s each.
-
-        0.1 degC is finer than the sensor is accurate, so nothing real is lost;
-        a row is now written only when the tenth actually moves. The raw
-        hundredths remain in `device.temperature` and so in diagnostics.
-        """
-        temperature = self._device.temperature
-        self._attr_native_value = (
-            None if temperature is None else round(temperature, 1)
+        """Publish a deadbanded whole-degree temperature (see `quantize`)."""
+        self._attr_native_value = quantize(
+            self._device.temperature, self._attr_native_value
         )
 
 
@@ -162,20 +189,21 @@ class HumiditySensor(ACInfinitySensor):
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_device_class = SensorDeviceClass.HUMIDITY
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_suggested_display_precision = 1
+    _attr_suggested_display_precision = 0
 
     @callback
     def _update_attrs(self) -> None:
-        """Publish the humidity rounded to 0.1 %.
+        """Publish a deadbanded whole-percent humidity (see `quantize`).
 
-        Same hundredths-resolution noise as the temperature sensor above, for
-        the same reason. The Airtap models on this install report no humidity
-        at all (the entity sits at `unknown`), so this costs nothing here; it
-        is rounded so a controller that *does* report it cannot reproduce the
-        recorder flood the temperature sensors caused.
+        The Airtap models on this install report no humidity at all (the
+        entity sits at `unknown`), so this costs nothing here; it is
+        deadbanded so a controller that *does* report it cannot reproduce the
+        recorder flood the temperature sensors caused. A deadband of 0.8 %RH
+        is far inside these sensors' accuracy.
         """
-        humidity = self._device.humidity
-        self._attr_native_value = None if humidity is None else round(humidity, 1)
+        self._attr_native_value = quantize(
+            self._device.humidity, self._attr_native_value
+        )
 
 
 class VpdSensor(ACInfinitySensor):
