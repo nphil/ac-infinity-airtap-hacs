@@ -95,11 +95,28 @@ class TemperatureSensor(ACInfinitySensor):
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
 
     @callback
     def _update_attrs(self) -> None:
-        """Handle updating _attr values."""
-        self._attr_native_value = self._device.temperature
+        """Publish the temperature rounded to 0.1 degC.
+
+        The device reports hundredths of a degree (`get_short(data, 8) / 100`)
+        and re-advertises every ~2 s, so the last digit is thermistor noise
+        that never repeats: every single update was a distinct state and
+        earned its own recorder row. Measured 2026-09-18 on the live install,
+        the six vents' temperature sensors held 3.19 M of 7.23 M rows - 48% of
+        the entire 15-day history, ~427 MiB with attributes and indexes - at
+        one row per 2.2 s each.
+
+        0.1 degC is finer than the sensor is accurate, so nothing real is lost;
+        a row is now written only when the tenth actually moves. The raw
+        hundredths remain in `device.temperature` and so in diagnostics.
+        """
+        temperature = self._device.temperature
+        self._attr_native_value = (
+            None if temperature is None else round(temperature, 1)
+        )
 
 
 class FanSpeedSensor(ACInfinitySensor):
@@ -145,11 +162,20 @@ class HumiditySensor(ACInfinitySensor):
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_device_class = SensorDeviceClass.HUMIDITY
     _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
 
     @callback
     def _update_attrs(self) -> None:
-        """Handle updating _attr values."""
-        self._attr_native_value = self._device.humidity
+        """Publish the humidity rounded to 0.1 %.
+
+        Same hundredths-resolution noise as the temperature sensor above, for
+        the same reason. The Airtap models on this install report no humidity
+        at all (the entity sits at `unknown`), so this costs nothing here; it
+        is rounded so a controller that *does* report it cannot reproduce the
+        recorder flood the temperature sensors caused.
+        """
+        humidity = self._device.humidity
+        self._attr_native_value = None if humidity is None else round(humidity, 1)
 
 
 class VpdSensor(ACInfinitySensor):
