@@ -337,7 +337,16 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
     async def _resume(_now: Any) -> None:
         """Rebuild the holds, for the restart that never came."""
         for entry, data in released:
-            if entry.entry_id not in hass.data.get(DOMAIN, {}):
+            # Identity, not membership. A RELOAD inside the window puts the
+            # entry id straight back into hass.data with a NEW data/device, so
+            # "is it still there" passes - and re-arming the captured OLD
+            # device then starts a supervisor that no unload will ever cancel
+            # (its entry now points at the new device). Two supervisors then
+            # fight for a fan that accepts one connection: the loser retries
+            # forever ("never seen by any scanner", ~900 attempts observed
+            # 2026-09-22..24 on two vents that were connected throughout), and
+            # the winner can flip whenever the fan re-advertises.
+            if hass.data.get(DOMAIN, {}).get(entry.entry_id) is not data:
                 continue  # unloaded or reloaded meanwhile; it owns itself now
             if not entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION):
                 continue
