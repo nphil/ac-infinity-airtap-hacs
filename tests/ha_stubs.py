@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntFlag, StrEnum
@@ -148,6 +149,12 @@ def install() -> bool:
 
     habluetooth.HaBluetoothSlotAllocations = HaBluetoothSlotAllocations
     habluetooth.get_manager = lambda: _stub_manager
+
+    # bluetooth_data_tools: the coarse monotonic clock the coordinator's poll
+    # bookkeeping reads. Shipped with Home Assistant at runtime, like
+    # habluetooth above; a plain monotonic clock is all the tests need.
+    bluetooth_data_tools = _module("bluetooth_data_tools")
+    bluetooth_data_tools.monotonic_time_coarse = time.monotonic
 
     ha = _module("homeassistant")
 

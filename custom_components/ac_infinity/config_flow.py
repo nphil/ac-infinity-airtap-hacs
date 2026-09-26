@@ -184,12 +184,18 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-def _preferred_proxy_choices(hass: HomeAssistant, current: str) -> list[str]:
-    """Node names of connectable scanners right now, plus ``current``.
+def _preferred_proxy_choices(
+    hass: HomeAssistant, current: str
+) -> list[selector.SelectOptionDict]:
+    """Automatic, then the node names of connectable scanners, plus ``current``.
 
     ``current`` (the entry's already-configured value) is included even
     when no live scanner reports it, so a proxy that is temporarily offline
     is never silently dropped from a choice the operator already made.
+
+    Automatic's value is the empty string, which Home Assistant cannot
+    translate (translation keys must be non-empty), so its label is carried
+    here rather than in strings.json.
     """
     names = {
         scanner.adapter
@@ -198,7 +204,12 @@ def _preferred_proxy_choices(hass: HomeAssistant, current: str) -> list[str]:
     }
     if current:
         names.add(current)
-    return [DEFAULT_PREFERRED_PROXY, *sorted(names)]
+    return [
+        selector.SelectOptionDict(
+            value=DEFAULT_PREFERRED_PROXY, label="Automatic (strongest signal)"
+        ),
+        *(selector.SelectOptionDict(value=name, label=name) for name in sorted(names)),
+    ]
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
@@ -245,7 +256,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                             ),
                             mode=selector.SelectSelectorMode.DROPDOWN,
                             custom_value=True,
-                            translation_key=CONF_PREFERRED_PROXY,
                         )
                     ),
                 }

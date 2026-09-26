@@ -34,13 +34,6 @@
       }
     }
   },
-  "selector": {
-    "preferred_proxy": {
-      "options": {
-        "": "Automatic (strongest signal)"
-      }
-    }
-  },
   "entity": {
     "sensor": {
       "connection": {
