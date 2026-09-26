@@ -164,8 +164,13 @@ class ACInfinityFan(
         else:
             self._attr_is_on = self._device.is_on
             self._attr_preset_mode = None
-        self._attr_percentage = ranged_value_to_percentage(
-            SPEED_RANGE, self._device.state.fan
+        # The live level (notifications while the link is held, the
+        # advertised byte otherwise). In a preset the fan is still "on" -
+        # the device is running itself - but the speed is whatever that mode
+        # chose right now: AUTO idling inside its range reads 0 %.
+        level = self._device.state.fan
+        self._attr_percentage = (
+            None if level is None else ranged_value_to_percentage(SPEED_RANGE, level)
         )
 
     @callback

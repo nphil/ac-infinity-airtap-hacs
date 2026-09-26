@@ -59,6 +59,7 @@ from bleak_retry_connector import (
 )
 
 from .const import (
+    LIVE_LEVEL_NOTIFICATION_TYPES,
     MANUFACTURER_ID,
     POSSIBLE_READ_CHARACTERISTIC_UUIDS,
     POSSIBLE_WRITE_CHARACTERISTIC_UUIDS,
@@ -520,7 +521,12 @@ class ACInfinityController:
             self._state.vpd = get_short(data, 12) / 100
             self._state.fan_type = get_short(data, 14)
             self._state.fan_state = get_bits(data[16], 0, 2)
-            # self._state.fan = get_bits(data[17], 0, 4) # Not accurate
+            if self._state.type in LIVE_LEVEL_NOTIFICATION_TYPES:
+                # The live level: see LIVE_LEVEL_NOTIFICATION_TYPES for the
+                # measurement. Upstream left this commented out as "Not
+                # accurate", which on these fans froze the reported speed at
+                # whatever the last manufacturer-data advertisement said.
+                self._state.fan = get_bits(data[17], 0, 4)
             self._state.work_type = get_bits(data[17], 4, 4)
             self._fire_callbacks(CallbackType.NOTIFICATION)
 

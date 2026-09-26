@@ -25,6 +25,11 @@ provably speaks today. No guessed commands are ever sent to the hardware.
   registers the fan's own control panel edits; the device stores them in
   seconds and keeps them independently of which mode is selected, so a
   duration can be prepared before the preset is switched.
+- **Display switch** — turns the fan's own screen on or off, keeping its
+  brightness setting, and reads the setting back with every poll (about once
+  a minute). It reads unknown, and refuses to send anything, until the fan
+  has reported its display register with a backlight byte; fans that report
+  only a brightness have no switch to drive.
 - **Sensors** — temperature, fan speed; humidity and VPD only on device
   types that actually carry those sensors. The AIRTAP (type 6) has **no
   humidity sensor** (the device reports a constant 0), so no humidity
@@ -35,6 +40,13 @@ provably speaks today. No guessed commands are ever sent to the hardware.
   auto thresholds, timer/cycle durations). Holding the connection silences
   a fan's advertisements almost entirely, so while a link is held the poll
   is driven by the link itself — on connect, then once a minute.
+- **Live fan speed** — the fan's percentage and the Speed sensor show the
+  level the fan is running at right now, including in **Auto** (0 % while it
+  idles inside its range, its maximum or transition level once a trigger
+  fires). While a link is held this comes from the notification the AIRTAP
+  sends once a second; otherwise from its advertisements. Nothing from the
+  pairing-time snapshot is shown as a live reading: until the fan reports,
+  speed and temperature read unknown.
 - **Held Bluetooth connection** (option, on by default) — the GATT link to
   each fan stays open, so a command lands in ~0.2 s instead of paying a 2-6 s
   proxy connect. It costs one of a proxy's three connection slots per fan and
@@ -53,7 +65,9 @@ provably speaks today. No guessed commands are ever sent to the hardware.
 - **Genuine availability** — entities go unavailable when no Bluetooth
   scanner/proxy has seen the fan for the tracked interval, and recover on
   the first frame seen again; a fan on a live held connection always counts
-  as available.
+  as available. When a held link drops and the fan does not advertise within
+  30 s (it lost power, or its radio hung), every entity goes unavailable
+  rather than keep showing its last values.
 - **Diagnostics** — a **Connection** sensor naming the proxy that currently
   carries the link (`disconnected` when there is none), with drop counts,
   the reconnect attempt, and the preferred-proxy choice as attributes; plus

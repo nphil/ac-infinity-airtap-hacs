@@ -55,6 +55,19 @@ OPCODE_TIMER_TO_ON = 20
 OPCODE_TIMER_TO_OFF = 21
 OPCODE_CYCLE = 22
 
+# Display register: [brightness gear] or [brightness gear, backlight 0/1].
+# The AC Infinity app reads it with its settings (opcodes 32-36) and writes
+# it in the 2-byte form only to fans whose read answered with two bytes, so
+# the switch below works the same way: it writes nothing until the fan has
+# reported the register, and never in a form the fan did not report.
+OPCODE_DISPLAY = 33
+
+# Every poll reads the mode registers (get_model_data's 16-23) and the
+# display register in one round trip. The fan answers each group it was
+# asked for (an empty one for a register it lacks, as with 23), so the
+# extra group cannot disturb the others.
+POLL_OPCODES = (16, 17, 18, 19, 20, 21, 22, 23, OPCODE_DISPLAY)
+
 # Longest duration the AIRTAP control panel can express (23:59:00). The
 # registers are four bytes wide, so this bound is the hardware's, not the
 # wire format's; it keeps a mistyped automation from parking a fan on a
@@ -116,6 +129,10 @@ class DeviceInfoEx(DeviceInfo):
         return DeviceInfoEx(**device_info.__dict__)
 
     auto_mode: Optional[AutoModeConfig] = None
+    # Display register (OPCODE_DISPLAY). display_on stays None for a fan that
+    # reports only a brightness byte: it has no backlight switch to drive.
+    display_brightness: Optional[int] = None
+    display_on: Optional[bool] = None
 
 
 @dataclass
@@ -377,16 +394,19 @@ class ACInfinityDevice(ACInfinityController):
     async def update(self) -> None:
         """Poll the device for state not present in BLE advertisements.
 
-        Fetches work_type, the speed bounds, the AUTO threshold block and the
-        timer/cycle durations, by walking the response's ``[opcode, length,
-        value]`` groups (see ``parse_model_data``) rather than trusting fixed
-        offsets — which is what makes the groups past the AUTO block readable
-        at all.
+        Fetches work_type, the speed bounds, the AUTO threshold block, the
+        timer/cycle durations and the display register, by walking the
+        response's ``[opcode, length, value]`` groups (see
+        ``parse_model_data``) rather than trusting fixed offsets — which is
+        what makes the groups past the AUTO block readable at all.
         """
         await self._ensure_connected()
         try:
             _LOGGER.debug("%s: Updating model data", self.name)
-            command = self._protocol.get_model_data(self.state.type, 0, self.sequence)
+            command = list(POLL_OPCODES)
+            if self.state.type in FAMILY_E_MODELS:
+                command += [255, 0]
+            command = self._protocol._add_head(command, 1, self.sequence)
             if data := await self._send_command(command):
                 groups = parse_model_data(data)
                 if 16 not in groups or len(groups.get(OPCODE_AUTO_THRESHOLDS, b"")) < 7:
@@ -425,6 +445,12 @@ class ACInfinityDevice(ACInfinityController):
                     if cycle is not None and len(cycle) >= 8:
                         self.state.cycle_on = _duration(cycle[:4])
                         self.state.cycle_off = _duration(cycle[4:8])
+                    display = groups.get(OPCODE_DISPLAY)
+                    if display:
+                        self.state.display_brightness = display[0]
+                        self.state.display_on = (
+                            bool(display[1]) if len(display) >= 2 else None
+                        )
 
                     self._config_changed_since_last_update = False
                     self._fire_callbacks(CallbackType.UPDATE_RESPONSE)
@@ -466,6 +492,32 @@ class ACInfinityDevice(ACInfinityController):
     async def set_mode_auto(self) -> None:
         """Set the device's mode to automatic."""
         await self.async_set_work_type(WORK_TYPE_AUTO)
+
+    async def async_set_display(self, on: bool) -> None:
+        """Turn the fan's display on or off, keeping its brightness gear.
+
+        Sends the register in the only form the fan itself reported (see
+        OPCODE_DISPLAY), so it refuses until a poll has read it back with a
+        backlight byte.
+        """
+        if self.state.display_on is None or self.state.display_brightness is None:
+            raise ValueError(
+                "This fan has not reported a display switch; cannot change it"
+            )
+        _LOGGER.debug("%s: Setting display %s", self.name, "on" if on else "off")
+
+        command = [OPCODE_DISPLAY, 2, self.state.display_brightness, 1 if on else 0]
+        if self.state.type in FAMILY_E_MODELS:
+            command += [255, 0]
+        command = self._protocol._add_head(command, 3, self.sequence)
+        await self._ensure_connected()
+        try:
+            await self._send_command(command)
+
+            self.state.display_on = on
+            self._config_changed_since_last_update = True
+        finally:
+            await self._execute_disconnect()
 
     async def async_set_auto_high_temp(self, value: float) -> None:
         if self.auto_mode is None:

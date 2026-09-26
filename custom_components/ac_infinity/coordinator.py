@@ -28,6 +28,16 @@ them to availability would cause constant flapping while advertisement data
 is still perfectly good.  A live GATT link overrides all of that: a held
 device advertises far less often (observed live), so the advertisement
 tracker can call it unavailable while we are actively talking to it.
+
+Losing that link must therefore be announced to the entities, or they keep
+showing whatever they last showed: nothing else re-renders them when the
+tracker had already given up before the drop.  Live on 2026-09-25 the
+Master Bedroom vent lost power for 90 minutes while its fan entity read
+"on, 60 %" and its temperature held its last value; only the Connection
+sensor (which has its own hold listener) went unavailable.  A drop is
+given LINK_LOSS_GRACE to be followed by an advertisement, which a powered
+fan sends within about a second of any disconnect; then the entities are
+re-rendered against the truth.
 """
 from __future__ import annotations
 
@@ -106,6 +116,14 @@ LINK_POLL_INTERVAL = timedelta(seconds=60)
 # one attempt per minute — so 15 minutes of nothing means the automatic
 # recovery has genuinely given up, not that a proxy is mid-roam.
 UNREACHABLE_AFTER = timedelta(minutes=15)
+
+# How long entities stay available after the held link drops with nothing
+# else proving the fan is reachable. A fan that is merely disconnected starts
+# advertising again almost at once (15 of the Master Bedroom vent's 16 drops
+# on the night of 2026-09-24 were followed by an advertisement within 2.1 s),
+# which re-marks it available on its own; only a fan that has gone silent -
+# unpowered or wedged - is still unaccounted for when this runs out.
+LINK_LOSS_GRACE = 30
 
 
 def _async_holding_scanner(
@@ -357,6 +375,10 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         self._cancel_link_poll_timer: CALLBACK_TYPE | None = None
         self._link_poll_task: asyncio.Task[None] | None = None
         self._health_listener: CALLBACK_TYPE | None = None
+        # Whether the held link was up at the last hold-status change, and
+        # the pending LINK_LOSS_GRACE timer while a fresh drop is unexplained.
+        self._link_up = False
+        self._cancel_link_grace: CALLBACK_TYPE | None = None
 
     @property
     def available(self) -> bool:
@@ -366,10 +388,16 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         live), so ``async_track_unavailable`` can declare it gone while the
         integration is holding an open connection to it and commands are
         landing in ~200 ms.  A live link is the strongest proof of
-        reachability there is, so it wins; everything else falls through to
-        the base class's advertisement logic unchanged.
+        reachability there is, so it wins, and a link that dropped less than
+        LINK_LOSS_GRACE ago still counts while the fan gets its chance to
+        advertise; everything else falls through to the base class's
+        advertisement logic unchanged.
         """
-        return self.controller.is_connected or super().available
+        return (
+            self.controller.is_connected
+            or self._cancel_link_grace is not None
+            or super().available
+        )
 
     @property
     def link_healthy(self) -> bool:
@@ -423,13 +451,13 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         self._cancel_controller_callback = self.controller.register_callback(
             self._async_handle_controller_push
         )
-        # Link-driven polling — see LINK_POLL_INTERVAL. The hold status
-        # notifies on every reconnect-attempt change, so a link that has just
-        # come up is polled as soon as it is usable; the interval timer covers
-        # the steady state, where a silent held fan means nothing else would
-        # ever ask.
+        # Link-driven polling — see LINK_POLL_INTERVAL — and link-driven
+        # availability. The hold status notifies on every reconnect-attempt
+        # change, so a link that has just come up is polled as soon as it is
+        # usable; the interval timer covers the steady state, where a silent
+        # held fan means nothing else would ever ask.
         self._cancel_hold_listener = self.controller.hold_status.add_listener(
-            self._async_schedule_link_poll
+            self._async_hold_status_changed
         )
         self._cancel_link_poll_timer = async_track_time_interval(
             self.hass, self._async_link_poll_tick, LINK_POLL_INTERVAL
@@ -450,7 +478,39 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         if self._link_poll_task is not None:
             self._link_poll_task.cancel()
             self._link_poll_task = None
+        self._async_cancel_link_grace()
         super()._async_stop()
+
+    @callback
+    def _async_hold_status_changed(self) -> None:
+        """React to the held link coming up or going away.
+
+        A drop starts LINK_LOSS_GRACE; its expiry re-renders the entities,
+        which by then read unavailable unless an advertisement arrived in
+        the meantime (that path re-renders them itself).  Reconnecting
+        inside the window cancels it.  Every change also gets its chance at
+        a link poll, as before.
+        """
+        link_up = self.controller.is_connected
+        if link_up != self._link_up:
+            self._link_up = link_up
+            self._async_cancel_link_grace()
+            if not link_up:
+                self._cancel_link_grace = async_call_later(
+                    self.hass, LINK_LOSS_GRACE, self._async_link_grace_expired
+                )
+        self._async_schedule_link_poll()
+
+    @callback
+    def _async_link_grace_expired(self, _now: datetime) -> None:
+        self._cancel_link_grace = None
+        self.async_update_listeners()
+
+    @callback
+    def _async_cancel_link_grace(self) -> None:
+        if self._cancel_link_grace is not None:
+            self._cancel_link_grace()
+            self._cancel_link_grace = None
 
     @callback
     def _async_handle_controller_push(

@@ -39,6 +39,13 @@ async def async_setup_entry(
                          "Auto Mode Low Temperature Trigger",
                          lambda d: None if d.auto_mode is None else d.auto_mode.low_temp_enabled,
                          ACInfinityDevice.async_set_auto_mode_low_temp_enabled),
+        # The fan's own screen. Unknown until a poll reads the display
+        # register back; see OPCODE_DISPLAY for why it writes nothing before.
+        ACInfinitySwitch(data.coordinator,
+                         data.device,
+                         "Display",
+                         lambda d: d.state.display_on,
+                         ACInfinityDevice.async_set_display),
     ]
 
     async_add_entities(entities)

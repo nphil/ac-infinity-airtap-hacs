@@ -38,12 +38,19 @@ Payloads are ``[opcode, value_length, value...]`` groups::
                          temperatures are sent in BOTH Fahrenheit and
                          Celsius; ``switches`` bits: 0x08 high temp,
                          0x04 low temp, 0x02 high hum, 0x01 low hum
+    [33, 2, gear, on]    display: brightness gear (01/02/03, A2/A3 dim
+                         after 15 s) and backlight 0/1 (integration
+                         async_set_display). Fans that answer with one
+                         byte have no backlight switch; nothing is sent to
+                         them. Taken from the decompiled vendor app 2.0.9
+                         (ProtocolResolution setSettingData/parseSetting).
     [255, port]          appended for multi-port device types 7/9/11/12
                          only (the same types whose advertisements carry
                          ``choose_port``); every in-tree caller passes
                          port=0
 
-``get_model_data`` queries opcodes ``[16..23]`` with command class 1.
+``get_model_data`` queries opcodes ``[16..23]`` with command class 1; the
+integration's poll adds 33 to the same read (device.POLL_OPCODES).
 
 Modes: 12 named, 3 drivable
 ---------------------------
@@ -114,10 +121,17 @@ learned from polls/notifications, and the None-filtering merge in
 advertisement updates.
 
 Broadcast notification frame (first bytes 0x1E 0xFF, parsed in
-``ACInfinityController._notification_handler``, len >= 18): carries
-tmp/hum/vpd/fan_type/fan_state and work_type (high nibble of data[17]).
-The fan-level nibble in that frame is explicitly NOT trusted (upstream
-comment: "Not accurate"); the live level comes from advertisements.
+``ACInfinityController._notification_handler``, len >= 18), sent about once
+a second while a GATT link is open: carries tmp/hum/vpd/fan_type/fan_state,
+work_type (LOW nibble of data[17]) and the live fan level (HIGH nibble of
+data[17]). Upstream distrusted the level nibble ("Not accurate"); it is read
+only for LIVE_LEVEL_NOTIFICATION_TYPES, where it was measured to be exact
+(see const.py). On those fans data[16] bits 0-1 (fan_state) were observed to
+read 2 while the level steps up, 1 while it steps down and 0 when steady.
+
+While a link is held, an AIRTAP advertises by local name alone ("BLE_FAN")
+with no manufacturer data, so advertisements cannot keep the level fresh
+then: the notification is the only live source.
 """
 from .models import DeviceInfo
 from .util import crc16, get_bit, get_bits, get_short

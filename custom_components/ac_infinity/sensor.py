@@ -162,15 +162,15 @@ class FanSpeedSensor(ACInfinitySensor):
 
         A stopped fan is 0% — never a retained last-known running speed (the
         old _last_speed cache made a stopped fan read 80%, verified live).
-        None is reserved for a speed the device has never reported at all.
+        None is reserved for a speed the device has not reported since setup.
 
         Deliberately NOT gated on work_type: OFF mode on these devices is
         itself a level (level_off, the "off speed" — see the vendored
         update()/turn_off(), which model work_type 1 as fan = level_off), so
         forcing 0 whenever the mode is OFF would misreport blades genuinely
-        spinning at a nonzero off speed. The advertised fan byte is the
-        device's own report of the current level, refreshed every few
-        seconds, and reads 0 when the fan is truly stopped.
+        spinning at a nonzero off speed. The level is the device's own
+        report: its once-a-second notification while the link is held, its
+        advertised byte otherwise. It reads 0 when the fan is truly stopped.
         """
         fan_speed = self._device.state.fan
         if fan_speed is None:

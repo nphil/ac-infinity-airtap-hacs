@@ -147,3 +147,25 @@ class TestSpeedClearsPreset:
         asyncio.run(fan.async_set_percentage(0))
         assert ("set_speed", 0) in device.calls
         assert fan.is_on is False
+
+
+class TestLiveSpeed:
+    """The card shows fan.percentage, so it must be the level the fan is
+    running at right now, whatever drove it there (2026-09-25: a vent in AUTO
+    idling inside its range read 60 %, its pairing-day level)."""
+
+    def test_auto_idling_inside_its_range_reads_zero_percent(self):
+        fan, device, _ = make_fan(fan_speed=0)
+        device.state.work_type = WORK_TYPE_AUTO
+        fan._update_attrs()
+        assert (fan.is_on, fan.preset_mode, fan.percentage) == (
+            True,
+            PRESET_AUTO_MODE,
+            0,
+        )
+
+    def test_a_level_not_yet_reported_is_unknown_not_a_guess(self):
+        fan, device, _ = make_fan()
+        device.state.fan = None
+        fan._update_attrs()
+        assert fan.percentage is None

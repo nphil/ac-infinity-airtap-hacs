@@ -92,6 +92,37 @@ def _device_info_from_entry_data(service_data: Any) -> DeviceInfoEx:
     )
 
 
+# Readings, as opposed to identity. CONF_SERVICE_DATA is the advertisement
+# seen when the fan was paired, so these fields hold that moment's values.
+_PAIRING_READINGS = (
+    "tmp",
+    "hum",
+    "vpd",
+    "fan",
+    "fan_state",
+    "tmp_state",
+    "hum_state",
+    "vpd_state",
+)
+
+
+def _runtime_state_from_entry_data(service_data: Any) -> DeviceInfoEx:
+    """The state a fan starts with: its stored identity, none of its readings.
+
+    Seeding the pairing snapshot's readings made a held fan report its
+    pairing-day speed after every restart or reload, and nothing corrected
+    it: a held fan sends no manufacturer data. Live on 2026-09-25 the Master
+    Bedroom vent read 60 % from each restart until its next link drop, while
+    its own broadcasts showed it idling at 0 overnight and ramping 6-9
+    that evening. Unknown until the fan itself reports is the honest start;
+    its first notification arrives about a second after the link comes up.
+    """
+    return dataclasses.replace(
+        _device_info_from_entry_data(service_data),
+        **dict.fromkeys(_PAIRING_READINGS),
+    )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up AC Infinity from a config entry."""
     _async_register_services(hass)
@@ -113,7 +144,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             f"Could not find AC Infinity device with address {address}"
         )
 
-    device_info = _device_info_from_entry_data(entry.data[CONF_SERVICE_DATA])
+    device_info = _runtime_state_from_entry_data(entry.data[CONF_SERVICE_DATA])
 
     def _on_proxy_choice(_scanner_name: str, preferred_used: bool) -> None:
         device.hold_status.set_via_preferred_proxy(preferred_used)
