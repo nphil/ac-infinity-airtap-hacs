@@ -348,7 +348,12 @@ class ConditionedAirSensor(ACInfinitySensor, RestoreSensor):
             self.async_on_remove(
                 async_track_state_change_event(
                     self.hass, [thermostat],
-                    lambda event: self._async_action(event.data.get("new_state")),
+                    # The thermostat's integration has been observed firing
+                    # state changes from a worker thread; hop to the loop or
+                    # the write below trips HA's thread-safety guard.
+                    lambda event: self.hass.add_job(
+                        self._async_action, event.data.get("new_state")
+                    ),
                 )
             )
             self._async_action(self.hass.states.get(thermostat))

@@ -142,7 +142,14 @@ class CirculationController:
         if self.thermostat:
             self._unsubscribes.append(
                 async_track_state_change_event(
-                    self._hass, [self.thermostat], self._async_thermostat_changed
+                    self._hass, [self.thermostat],
+                    # add_job hops to the event loop: the thermostat's
+                    # integration has been observed firing state changes
+                    # from a worker thread, and everything below schedules
+                    # timers and tasks that must run on the loop.
+                    lambda event: self._hass.add_job(
+                        self._async_thermostat_changed, event.data.get("new_state")
+                    ),
                 )
             )
             self._async_blower(blower_running(self._hass.states.get(self.thermostat)))
@@ -155,8 +162,8 @@ class CirculationController:
         self._async_cancel_hold()
 
     @callback
-    def _async_thermostat_changed(self, event: Any) -> None:
-        self._async_blower(blower_running(event.data.get("new_state")))
+    def _async_thermostat_changed(self, state: State | None) -> None:
+        self._async_blower(blower_running(state))
 
     @callback
     def _async_blower(self, running: bool | None) -> None:

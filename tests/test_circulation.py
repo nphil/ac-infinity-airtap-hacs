@@ -34,6 +34,10 @@ class FakeHass:
         self.states[THERMOSTAT] = state
         return state
 
+    def add_job(self, target, *args):
+        """HA hops threads with this; the fake is always 'on the loop'."""
+        return target(*args)
+
     def async_create_background_task(self, coro, name):
         task = asyncio.get_running_loop().create_task(coro, name=name)
         self.tasks.append(task)
