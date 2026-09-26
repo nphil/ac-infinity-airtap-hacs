@@ -131,7 +131,11 @@ class ACInfinityFan(
         self._attr_is_on = False
         self._attr_percentage = 0
         self.async_write_ha_state()
-        await self._device.turn_off()
+        # OFF mode at level 0, not the vendored turn_off: that keeps OFF
+        # mode's stored level, which is the same register as AUTO's minimum
+        # (17). circulation.py raises that minimum while the blower runs, so
+        # "off" would otherwise leave the fan spinning at circulation speed.
+        await self._device.set_speed(0)
         self.coordinator.async_update_listeners()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:

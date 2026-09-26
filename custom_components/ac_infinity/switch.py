@@ -33,12 +33,14 @@ async def async_setup_entry(
                          data.device,
                          "Auto Mode High Temperature Trigger",
                          lambda d: None if d.auto_mode is None else d.auto_mode.high_temp_enabled,
-                         ACInfinityDevice.async_set_auto_mode_high_temp_enabled),
+                         ACInfinityDevice.async_set_auto_mode_high_temp_enabled,
+                         "Speed up for hot air"),
         ACInfinitySwitch(data.coordinator,
                          data.device,
                          "Auto Mode Low Temperature Trigger",
                          lambda d: None if d.auto_mode is None else d.auto_mode.low_temp_enabled,
-                         ACInfinityDevice.async_set_auto_mode_low_temp_enabled),
+                         ACInfinityDevice.async_set_auto_mode_low_temp_enabled,
+                         "Speed up for cold air"),
         # The fan's own screen. Unknown until a poll reads the display
         # register back; see OPCODE_DISPLAY for why it writes nothing before.
         ACInfinitySwitch(data.coordinator,
@@ -67,10 +69,12 @@ class ACInfinitySwitch(
         name: str,
         get_is_on: Callable[[ACInfinityDevice], Optional[bool]],
         async_set_is_on: Callable[[ACInfinityDevice, bool], Awaitable[None]],
+        display_name: str | None = None,
     ) -> None:
         super().__init__(coordinator)
         self._device = device
-        self._attr_name = name
+        # `name` seeds the unique_id and must stay stable; only the label moves.
+        self._attr_name = display_name or name
         self._attr_unique_id = f"{self._device.address}_switch_{slugify(name)}"
         self._attr_device_info = DeviceInfo(
             name=device.name,

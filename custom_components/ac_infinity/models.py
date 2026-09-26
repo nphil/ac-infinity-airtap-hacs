@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .device import ACInfinityDevice
+from .circulation import CirculationController, VentSettings
 from .coordinator import ACInfinityDataUpdateCoordinator, ACInfinityLinkWatchdog
+from .device import ACInfinityDevice
 
 
 @dataclass
@@ -16,3 +17,5 @@ class ACInfinityData:
     # from the integration's side too instead of only being closed by the
     # flow finishing.
     watchdog: ACInfinityLinkWatchdog
+    settings: VentSettings
+    circulation: CirculationController

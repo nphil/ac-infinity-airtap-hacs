@@ -27,6 +27,7 @@ from .const import (
     BLEAK_EXCEPTIONS,
     CONF_HOLD_CONNECTION,
     CONF_PREFERRED_PROXY,
+    CONF_THERMOSTAT,
     DEFAULT_HOLD_CONNECTION,
     DEFAULT_PREFERRED_PROXY,
     DOMAIN,
@@ -216,9 +217,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     """Per-fan tunables.
 
     ``self.config_entry`` is supplied by Home Assistant; assigning it here
-    is removed API.  Changing an option triggers the entry update listener
-    in __init__.py, which reloads the entry — that is what starts or stops
-    the hold supervisor.
+    is removed API.  Changing the hold, the preferred proxy or the
+    thermostat triggers the entry update listener in __init__.py, which
+    reloads the entry: that is what starts or stops the hold supervisor and
+    re-subscribes the circulation controller and air sensors.
     """
 
     async def async_step_init(
@@ -228,11 +230,14 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         if user_input is not None:
             # MERGE, never replace: options also hold bookkeeping the
             # integration writes itself (the last holding proxy, the outlet
-            # the repair wizard learned), and this form does not offer those.
-            # Replacing would wipe them on every hold toggle.
-            return self.async_create_entry(
-                data={**self.config_entry.options, **user_input}
-            )
+            # the repair wizard learned) and the speeds the number entities
+            # store, and this form does not offer those. Replacing would wipe
+            # them on every hold toggle.
+            options = {**self.config_entry.options, **user_input}
+            if CONF_THERMOSTAT not in user_input:
+                # An emptied optional field is simply absent from the input.
+                options.pop(CONF_THERMOSTAT, None)
+            return self.async_create_entry(data=options)
 
         preferred_proxy = self.config_entry.options.get(
             CONF_PREFERRED_PROXY, DEFAULT_PREFERRED_PROXY
@@ -257,6 +262,16 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                             mode=selector.SelectSelectorMode.DROPDOWN,
                             custom_value=True,
                         )
+                    ),
+                    vol.Optional(
+                        CONF_THERMOSTAT,
+                        description={
+                            "suggested_value": self.config_entry.options.get(
+                                CONF_THERMOSTAT
+                            )
+                        },
+                    ): selector.EntitySelector(
+                        selector.EntitySelectorConfig(domain="climate")
                     ),
                 }
             ),

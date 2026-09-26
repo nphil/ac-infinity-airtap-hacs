@@ -62,11 +62,32 @@ OPCODE_CYCLE = 22
 # reported the register, and never in a form the fan did not report.
 OPCODE_DISPLAY = 33
 
+# The rest of the vendor app's "settings" bundle (decompiled app 2.0.9,
+# ProtocolResolution.getSettingData reads 32, 33, 34, 36, 17, 18 for device
+# type 6). Each is read with every poll and written only in the exact shape
+# the fan reported, exactly like the display register.
+#   32 [unit]           display unit: 1 = Celsius, 0 = Fahrenheit
+#   34 [F, C, hum]      AUTO ramp: degrees per speed step (0 = jump to max)
+#   36 [F, C, hum]      temperature/humidity calibration, signed offsets
+# Register 35 (buffer) is deliberately not read: the app reads it only for
+# other models, and nobody has seen how an AIRTAP answers for it.
+OPCODE_UNIT = 32
+OPCODE_RAMP = 34
+OPCODE_CALIBRATION = 36
+
 # Every poll reads the mode registers (get_model_data's 16-23) and the
-# display register in one round trip. The fan answers each group it was
+# settings registers in one round trip. The fan answers each group it was
 # asked for (an empty one for a register it lacks, as with 23), so the
-# extra group cannot disturb the others.
-POLL_OPCODES = (16, 17, 18, 19, 20, 21, 22, 23, OPCODE_DISPLAY)
+# extra groups cannot disturb the others.
+POLL_OPCODES = (
+    16, 17, 18, 19, 20, 21, 22, 23,
+    OPCODE_UNIT, OPCODE_DISPLAY, OPCODE_RAMP, OPCODE_CALIBRATION,
+)
+
+# Display brightness gears, as the fan's own panel and the vendor app name
+# them: three fixed levels, and two that dim to level 1 after 15 s idle.
+DISPLAY_BRIGHTNESS_GEARS = {0x01: "Low", 0x02: "Medium", 0x03: "High",
+                            0xA2: "Auto-dim, medium", 0xA3: "Auto-dim, high"}
 
 # Longest duration the AIRTAP control panel can express (23:59:00). The
 # registers are four bytes wide, so this bound is the hardware's, not the
@@ -92,6 +113,24 @@ _LOGGER = logging.getLogger(ACInfinityController.__module__)
 # _config_changed_since_last_update so the next advertisement re-syncs
 # immediately after we change something ourselves.
 _MIN_SECONDS_BETWEEN_POLLS = 30
+
+
+def _f_to_c(fahrenheit: float) -> int:
+    """A reading in whole degrees Celsius."""
+    return round((fahrenheit - 32) * 5 / 9)
+
+
+def _f_delta_to_c(degrees_f: int) -> int:
+    """A difference (ramp step, calibration offset) in whole degrees Celsius.
+
+    Truncated, as the fan itself converts: a 1 F ramp set on the Master
+    Bedroom vent's own panel reads back as [1 F, 0 C] (2026-09-26).
+    """
+    return int(degrees_f * 5 / 9)
+
+
+def _signed_byte(value: int) -> int:
+    return value - 256 if value > 127 else value
 
 
 def _duration(value: bytes | None) -> Optional[int]:
@@ -133,16 +172,22 @@ class DeviceInfoEx(DeviceInfo):
     # reports only a brightness byte: it has no backlight switch to drive.
     display_brightness: Optional[int] = None
     display_on: Optional[bool] = None
+    # Settings registers, kept as the raw groups the fan reported so a write
+    # can send back every byte it does not mean to change.
+    display_celsius: Optional[bool] = None
+    ramp: Optional[tuple[int, ...]] = None
+    calibration: Optional[tuple[int, ...]] = None
 
 
 @dataclass
 class AutoModeConfig:
     """AUTO-mode trigger thresholds as read from/written to the device.
 
-    Temperatures are Celsius (the device stores both scales; is_degree is a
-    display flag only). Humidity fields exist for all device types, but the
-    AIRTAP type 6 has no humidity sensor — entity layers must not expose
-    humidity thresholds for it.
+    Temperatures are whole degrees in both scales, as the device stores
+    them: ``*_temp`` Celsius, ``*_temp_f`` Fahrenheit (None only for a config
+    built before the Fahrenheit bytes were read). Humidity fields exist for
+    all device types, but the AIRTAP type 6 has no humidity sensor — entity
+    layers must not expose humidity thresholds for it.
     """
 
     high_temp_enabled: bool
@@ -153,6 +198,8 @@ class AutoModeConfig:
     high_humidity: int
     low_humidity_enabled: bool
     low_humidity: int
+    high_temp_f: Optional[int] = None
+    low_temp_f: Optional[int] = None
 
 
 class ACInfinityDevice(ACInfinityController):
@@ -434,6 +481,8 @@ class ACInfinityDevice(ACInfinityController):
                         low_temp=thresholds[4],
                         high_humidity=thresholds[5],
                         low_humidity=thresholds[6],
+                        high_temp_f=thresholds[1],
+                        low_temp_f=thresholds[3],
                     )
 
                     # Absent on a model that does not answer for the register
@@ -451,6 +500,16 @@ class ACInfinityDevice(ACInfinityController):
                         self.state.display_on = (
                             bool(display[1]) if len(display) >= 2 else None
                         )
+                    unit = groups.get(OPCODE_UNIT)
+                    if unit:
+                        self.state.display_celsius = bool(unit[0] & 1)
+                    for opcode, field in (
+                        (OPCODE_RAMP, "ramp"),
+                        (OPCODE_CALIBRATION, "calibration"),
+                    ):
+                        value = groups.get(opcode)
+                        if value is not None and len(value) >= 3:
+                            setattr(self.state, field, tuple(value))
 
                     self._config_changed_since_last_update = False
                     self._fire_callbacks(CallbackType.UPDATE_RESPONSE)
@@ -519,22 +578,82 @@ class ACInfinityDevice(ACInfinityController):
         finally:
             await self._execute_disconnect()
 
-    async def async_set_auto_high_temp(self, value: float) -> None:
+    async def async_set_display_brightness(self, gear: int) -> None:
+        """Change the display brightness gear, keeping the on/off byte."""
+        if self.state.display_brightness is None:
+            raise ValueError("This fan has not reported its display; cannot change it")
+        if gear not in DISPLAY_BRIGHTNESS_GEARS:
+            raise ValueError(f"Unknown brightness gear {gear:#x}")
+        value = [gear] if self.state.display_on is None else [gear, int(self.state.display_on)]
+        await self._async_write_register(OPCODE_DISPLAY, value)
+        self.state.display_brightness = gear
+
+    async def async_set_display_celsius(self, celsius: bool) -> None:
+        """Show temperatures on the fan's display in Celsius or Fahrenheit."""
+        if self.state.display_celsius is None:
+            raise ValueError("This fan has not reported its display unit; cannot change it")
+        await self._async_write_register(OPCODE_UNIT, [1 if celsius else 0])
+        self.state.display_celsius = celsius
+
+    async def async_set_ramp_f(self, degrees_f: int) -> None:
+        """Set the AUTO ramp: how many degrees F past a trigger per speed step.
+
+        0 jumps straight from the resting speed to the full speed. Only the
+        temperature bytes change; the humidity byte goes back as read.
+        """
+        if self.state.ramp is None:
+            raise ValueError("This fan has not reported its ramp setting; cannot change it")
+        if not 0 <= degrees_f <= 20:
+            raise ValueError("ramp must be between 0 and 20 degrees F")
+        value = [degrees_f, _f_delta_to_c(degrees_f), *self.state.ramp[2:]]
+        await self._async_write_register(OPCODE_RAMP, value)
+        self.state.ramp = tuple(value)
+
+    async def async_set_calibration_f(self, offset_f: int) -> None:
+        """Offset the fan's temperature reading by whole degrees F."""
+        if self.state.calibration is None:
+            raise ValueError("This fan has not reported its calibration; cannot change it")
+        if not -20 <= offset_f <= 20:
+            raise ValueError("calibration must be between -20 and 20 degrees F")
+        value = [
+            offset_f & 0xFF,
+            _f_delta_to_c(offset_f) & 0xFF,
+            *self.state.calibration[2:],
+        ]
+        await self._async_write_register(OPCODE_CALIBRATION, value)
+        self.state.calibration = tuple(value)
+
+    @property
+    def ramp_f(self) -> Optional[int]:
+        return None if self.state.ramp is None else self.state.ramp[0]
+
+    @property
+    def calibration_f(self) -> Optional[int]:
+        cal = self.state.calibration
+        return None if cal is None else _signed_byte(cal[0])
+
+    async def async_set_hot_trigger_f(self, value: float) -> None:
+        """Air above this many degrees F speeds the fan up (AUTO high trigger)."""
         if self.auto_mode is None:
             raise ValueError(
                 "Auto mode configuration is not loaded; cannot change configuration values"
             )
-
-        new_config = dataclasses.replace(self.auto_mode, high_temp=round(value))
+        f = round(value)
+        new_config = dataclasses.replace(
+            self.auto_mode, high_temp_f=f, high_temp=_f_to_c(f)
+        )
         await self.async_set_auto_mode_config(new_config)
 
-    async def async_set_auto_low_temp(self, value: float) -> None:
+    async def async_set_cold_trigger_f(self, value: float) -> None:
+        """Air below this many degrees F speeds the fan up (AUTO low trigger)."""
         if self.auto_mode is None:
             raise ValueError(
                 "Auto mode configuration is not loaded; cannot change configuration values"
             )
-
-        new_config = dataclasses.replace(self.auto_mode, low_temp=round(value))
+        f = round(value)
+        new_config = dataclasses.replace(
+            self.auto_mode, low_temp_f=f, low_temp=_f_to_c(f)
+        )
         await self.async_set_auto_mode_config(new_config)
 
     async def async_set_auto_mode_high_temp_enabled(self, enabled: bool) -> None:
@@ -576,16 +695,20 @@ class ACInfinityDevice(ACInfinityController):
                 b |= 1
             return b
 
-        def c_to_f(celsius: float) -> float:
-            return round((celsius * 9.0 / 5.0) + 32.0, 2)
+        def c_to_f(celsius: float) -> int:
+            return round((celsius * 9.0 / 5.0) + 32.0)
 
         temp_hum_enabled_switches = byte_for_temp_hum_enabled_switches(config)
-        # Note: Logic does not differ based on value of is_degree, as that is
-        # a display flag only. The protocol carries both Celsius and
-        # Fahrenheit values; our data model uses Celsius only.
-        high_temp_f = round(c_to_f(config.high_temp))
+        # The device stores each trigger in both scales. Fahrenheit is kept
+        # exactly as read or set (whole-Celsius steps would round a 65 F
+        # trigger to 64 F); Celsius is derived only when no F value exists.
+        high_temp_f = (
+            config.high_temp_f if config.high_temp_f is not None else c_to_f(config.high_temp)
+        )
         high_temp_c = config.high_temp
-        low_temp_f = round(c_to_f(config.low_temp))
+        low_temp_f = (
+            config.low_temp_f if config.low_temp_f is not None else c_to_f(config.low_temp)
+        )
         low_temp_c = config.low_temp
 
         command = [

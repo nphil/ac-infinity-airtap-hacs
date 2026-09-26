@@ -26,6 +26,7 @@ from homeassistant.helpers.event import async_call_later
 
 from .ac_infinity_ble import DeviceInfo
 from .ble_affinity import make_affinity_client_class
+from .circulation import CirculationController, VentSettings
 from .const import (
     CONF_HOLD_CONNECTION,
     CONF_PREFERRED_PROXY,
@@ -47,6 +48,7 @@ from .models import ACInfinityData
 PLATFORMS: list[Platform] = [
     Platform.FAN,
     Platform.NUMBER,
+    Platform.SELECT,
     Platform.SENSOR,
     Platform.SWITCH,
 ]
@@ -223,8 +225,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # against a torn-down entry.
     entry.async_on_unload(watchdog.async_stop)
 
+    settings = VentSettings(hass, entry)
+    circulation = CirculationController(
+        hass, settings, device, coordinator.async_update_listeners
+    )
+    entry.async_on_unload(circulation.async_stop)
+
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = ACInfinityData(
-        entry.title, device, coordinator, watchdog
+        entry.title, device, coordinator, watchdog, settings, circulation
     )
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
@@ -235,20 +243,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     watchdog.async_start()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    circulation.async_start()
 
     return True
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry when the hold setting or preferred proxy changed.
+    """Reload the entry only when a setting it was set up with changed.
 
     ``entry.options`` also carries bookkeeping the integration writes itself
     (CONF_LAST_HOLDING_PROXY on every proxy change, CONF_RECOVERY_OUTLET when
-    the repair wizard learns an outlet).  Reloading for those would tear the
-    held link down for no reason, and a fan roaming between two proxies would
+    the repair wizard learns an outlet) and the speeds the number entities
+    store (circulation.py).  Reloading for those would tear the held link
+    down for no reason, and a fan roaming between two proxies would
     reload-loop: each reload reconnects, each reconnect writes the new proxy
-    name, which reloads again.  The live device is the truth about which
-    hold setting and preferred proxy this entry was actually set up with.
+    name, which reloads again.  The live device and circulation controller
+    are the truth about what this entry was actually set up with; a speed
+    change just asks the controller to re-check.
     """
     data: ACInfinityData | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     hold = entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION)
@@ -257,7 +268,10 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
         data is not None
         and bool(hold) == data.device.hold_status.hold
         and preferred_proxy == data.device.hold_status.preferred_proxy
+        and data.settings.thermostat == data.circulation.thermostat
     ):
+        data.circulation.async_reconcile()
+        data.coordinator.async_update_listeners()
         return
     await hass.config_entries.async_reload(entry.entry_id)
 
@@ -284,6 +298,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # (async_on_unload holds this same call for the failed-setup path;
         # async_stop is idempotent.)
         data.watchdog.async_stop()
+        # Before the hold stops too: the teardown notifies hold listeners,
+        # and a minimum write racing the disconnect would only fail.
+        data.circulation.async_stop()
         # Stop the supervisor BEFORE stop(): otherwise the forced teardown
         # below looks like a lost link and the hold immediately rebuilds the
         # connection we are trying to release.

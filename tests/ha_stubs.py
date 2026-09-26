@@ -181,6 +181,16 @@ def install() -> bool:
     core.HomeAssistant = HomeAssistant
     core.ServiceCall = ServiceCall
     core.CoreState = CoreState
+
+    class State:
+        """Just the fields the integration reads off a state."""
+
+        def __init__(self, entity_id, state, attributes=None) -> None:
+            self.entity_id = entity_id
+            self.state = state
+            self.attributes = attributes or {}
+
+    core.State = State
     core.CALLBACK_TYPE = Callable[[], None]
 
     # homeassistant.const
@@ -207,6 +217,7 @@ def install() -> bool:
     class Platform(StrEnum):
         FAN = "fan"
         NUMBER = "number"
+        SELECT = "select"
         SENSOR = "sensor"
         SWITCH = "switch"
 
@@ -490,6 +501,17 @@ def install() -> bool:
     sensor.SensorStateClass = SensorStateClass
     sensor.SensorEntity = SensorEntity
 
+    class RestoreSensor(SensorEntity):
+        """Nothing to restore under test."""
+
+        async def async_get_last_sensor_data(self):
+            return None
+
+        async def async_get_last_state(self):
+            return None
+
+    sensor.RestoreSensor = RestoreSensor
+
     # homeassistant.components.fan
     fan = _module("homeassistant.components.fan")
     components.fan = fan
@@ -555,6 +577,20 @@ def install() -> bool:
         SLIDER = "slider"
 
     number.NumberEntity = NumberEntity
+
+    # homeassistant.components.select
+    select = _module("homeassistant.components.select")
+    components.select = select
+
+    class SelectEntity(_WriteStateRecorder):
+        _attr_current_option = None
+        _attr_options: list = []
+
+        @property
+        def current_option(self):
+            return self._attr_current_option
+
+    select.SelectEntity = SelectEntity
     number.NumberDeviceClass = NumberDeviceClass
     number.NumberMode = NumberMode
 
@@ -761,6 +797,23 @@ def install() -> bool:
     event.async_track_time_interval = async_track_time_interval
 
     event.async_call_later = async_call_later
+
+    def async_track_state_change_event(hass, entity_ids, action):
+        """Record the subscription; tests deliver events by hand."""
+        subs = getattr(hass, "state_subscriptions", None)
+        if subs is None:
+            subs = []
+            hass.state_subscriptions = subs
+        sub = (tuple(entity_ids), action)
+        subs.append(sub)
+
+        def cancel() -> None:
+            if sub in subs:
+                subs.remove(sub)
+
+        return cancel
+
+    event.async_track_state_change_event = async_track_state_change_event
 
     # homeassistant.helpers.selector
     selector = _module("homeassistant.helpers.selector")

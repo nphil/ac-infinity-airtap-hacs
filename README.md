@@ -17,19 +17,33 @@ provably speaks today. No guessed commands are ever sent to the hardware.
 - **Fan entity** — OFF / ON with speed 1-10 (mapped to percentage), plus a
   preset for each mode the fan runs by itself: **Auto**, **Timer to On**,
   **Timer to Off** and **Cycle**.
-- **Auto-mode configuration** — number/switch entities for high/low
-  temperature triggers and their enable flags, and min/max fan speed bounds
-  used by AUTO. Written as the same threshold block the vendor app writes.
+- **How the fan responds to air** — in **Auto** the fan sits at its minimum
+  while the air is room temperature. Once the air drops below **Cold air
+  below** (or rises above **Hot air above**) it adds one speed per **Ramp**
+  degrees until **Full speed**; a ramp of 0 jumps straight there. Speeds are
+  the fan's own 0-10 levels and temperatures whole °F, the precision the fan
+  stores them at. The two triggers can each be switched off.
+- **Circulation speed** (needs a thermostat, set in *Configure*) — the
+  minimum becomes the **Circulation speed** while the thermostat reports the
+  HVAC blower running, and the **Rest speed** once the blower has been off for
+  **Circulation hold** minutes (20 by default). The fan stores its minimum in
+  its own memory, so this writes only when the value actually changes, never
+  retries a refused value within 10 minutes, ignores a thermostat that is
+  offline, and never touches a fan that is not in Auto. Without a thermostat
+  the rest speed applies all the time.
+- **Cold and warm air temperature** (needs the thermostat) — the average
+  temperature of the air the vent delivered over the steady part of the last
+  cooling (heating) cycle, leaving out the first 8 minutes while the ducts
+  cool down. Compare vents to find leaky ducts; the long-term statistics give
+  the daily average.
+- **Display** — screen on/off, brightness (low, medium, high, or auto-dim)
+  and °F/°C, plus a temperature **calibration** offset. Each is read back
+  with every poll and written only once the fan has reported that setting.
 - **Timer and cycle configuration** — number entities (in minutes) for the
   two countdown timers and for the cycle's on/off phases. These are the
   registers the fan's own control panel edits; the device stores them in
   seconds and keeps them independently of which mode is selected, so a
   duration can be prepared before the preset is switched.
-- **Display switch** — turns the fan's own screen on or off, keeping its
-  brightness setting, and reads the setting back with every poll (about once
-  a minute). It reads unknown, and refuses to send anything, until the fan
-  has reported its display register with a backlight byte; fans that report
-  only a brightness have no switch to drive.
 - **Sensors** — temperature, fan speed; humidity and VPD only on device
   types that actually carry those sensors. The AIRTAP (type 6) has **no
   humidity sensor** (the device reports a constant 0), so no humidity

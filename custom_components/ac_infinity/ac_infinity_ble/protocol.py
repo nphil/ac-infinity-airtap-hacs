@@ -38,19 +38,26 @@ Payloads are ``[opcode, value_length, value...]`` groups::
                          temperatures are sent in BOTH Fahrenheit and
                          Celsius; ``switches`` bits: 0x08 high temp,
                          0x04 low temp, 0x02 high hum, 0x01 low hum
+    [32, 1, unit]        display unit, 1 = Celsius (async_set_display_celsius)
     [33, 2, gear, on]    display: brightness gear (01/02/03, A2/A3 dim
                          after 15 s) and backlight 0/1 (integration
                          async_set_display). Fans that answer with one
                          byte have no backlight switch; nothing is sent to
-                         them. Taken from the decompiled vendor app 2.0.9
-                         (ProtocolResolution setSettingData/parseSetting).
+                         them.
+    [34, 3, F, C, hum]   AUTO ramp: degrees past a trigger per speed step,
+                         0 = straight to the maximum (async_set_ramp_f)
+    [36, 3, F, C, hum]   calibration offsets, signed (async_set_calibration_f)
+                         32-36 come from the decompiled vendor app 2.0.9
+                         (ProtocolResolution getSettingData/setSettingData/
+                         parseSetting), which reads 32, 33, 34, 36 for type 6.
     [255, port]          appended for multi-port device types 7/9/11/12
                          only (the same types whose advertisements carry
                          ``choose_port``); every in-tree caller passes
                          port=0
 
 ``get_model_data`` queries opcodes ``[16..23]`` with command class 1; the
-integration's poll adds 33 to the same read (device.POLL_OPCODES).
+integration's poll adds 32, 33, 34 and 36 to the same read
+(device.POLL_OPCODES).
 
 Modes: 12 named, 3 drivable
 ---------------------------

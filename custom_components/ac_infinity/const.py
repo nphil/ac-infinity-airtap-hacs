@@ -40,6 +40,21 @@ DEFAULT_PREFERRED_PROXY = ""
 CONF_LAST_HOLDING_PROXY = "last_holding_proxy"
 CONF_RECOVERY_OUTLET = "recovery_outlet"
 
+# Per-entry options behind the HA-side settings (see circulation.py). Written
+# by the integration's own number entities and the options flow; none of them
+# reloads the entry except a thermostat change.
+#
+# CONF_THERMOSTAT: climate entity whose hvac_action says when the blower
+# runs. Also what the cold/warm air sensors key their measurements on.
+# CONF_REST_SPEED / CONF_CIRCULATION_SPEED: the AUTO minimum (0-10) with the
+# blower off / running. CONF_CIRCULATION_HOLD: minutes after the blower
+# stops before the resting speed returns.
+CONF_THERMOSTAT = "thermostat"
+CONF_REST_SPEED = "rest_speed"
+CONF_CIRCULATION_SPEED = "circulation_speed"
+CONF_CIRCULATION_HOLD = "circulation_hold"
+DEFAULT_CIRCULATION_HOLD = 20
+
 DEVICE_MODEL = {1: "Controller 67",
                 6: "Airtap Series",
                 7: "Controller 69",
