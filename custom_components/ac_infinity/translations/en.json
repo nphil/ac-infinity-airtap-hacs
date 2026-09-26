@@ -43,7 +43,8 @@
   },
   "issues": {
     "device_unreachable": {
-      "title": "{name} has had no Bluetooth link for {minutes}+ minutes"
+      "title": "{name} has had no Bluetooth link for {minutes}+ minutes",
+      "description": "Home Assistant has not been able to hold a Bluetooth connection to {name} for {minutes} minutes. The usual causes are that the fan has lost power, or that no Bluetooth proxy near it is online. This repair clears itself as soon as the connection is back."
     }
   },
   "services": {
