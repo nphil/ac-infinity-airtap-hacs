@@ -676,6 +676,10 @@ def install() -> bool:
     # homeassistant.helpers
     helpers = _module("homeassistant.helpers")
 
+    config_validation = _module("homeassistant.helpers.config_validation")
+    helpers.config_validation = config_validation
+    config_validation.config_entry_only_config_schema = lambda domain: object()
+
     device_registry = _module("homeassistant.helpers.device_registry")
     helpers.device_registry = device_registry
     device_registry.CONNECTION_BLUETOOTH = "bluetooth"

@@ -12,8 +12,8 @@ import contextlib
 import dataclasses
 import logging
 import time
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Any
 
 import bleak_retry_connector
 import voluptuous as vol
@@ -23,6 +23,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_SERVICE_DATA, Platform
 from homeassistant.core import HassJob, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_call_later
 
@@ -48,6 +49,9 @@ from .coordinator import (
 from .device import ACInfinityDevice, AutoModeConfig, DeviceInfoEx
 from .models import ACInfinityData
 
+if TYPE_CHECKING:
+    from homeassistant.helpers.typing import ConfigType
+
 PLATFORMS: list[Platform] = [
     Platform.FAN,
     Platform.NUMBER,
@@ -57,6 +61,10 @@ PLATFORMS: list[Platform] = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
+
+# No YAML configuration; required by hassfest because this module defines
+# async_setup (the domain-lifetime shutdown latch).
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 def _device_info_from_entry_data(service_data: Any) -> DeviceInfoEx:
@@ -131,6 +139,12 @@ def _runtime_state_from_entry_data(service_data: Any) -> DeviceInfoEx:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up AC Infinity from a config entry."""
     _async_register_services(hass)
+    # Rule B: refuse while Home Assistant is shutting down. Stage-1 jobs were
+    # listed before this call, so a device built now would never be released;
+    # nothing may be created, started or recorded as an outage (hence before
+    # async_link_down too).
+    if shutting_down(hass):
+        raise ConfigEntryNotReady("Home Assistant is shutting down")
     address: str = entry.data[CONF_ADDRESS]
     ble_device = bluetooth.async_ble_device_from_address(hass, address.upper(), True)
     if not ble_device:
@@ -172,6 +186,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     coordinator = ACInfinityDataUpdateCoordinator(hass, _LOGGER, ble_device, device)
 
+    # Per-entry shutdown job. Home Assistant runs these in stage 1 of its stop
+    # (concurrently, before EVENT_HOMEASSISTANT_STOP), while the bluetooth
+    # stack and the proxy connections are still alive - the one moment a
+    # disconnect can still complete (see "Releasing the GATT link" below).
+    # Registered the moment the link-holding object exists, with no await
+    # (and no started hold) before it: the job list is read once, so a job
+    # added after stage 1 began would never run. The watchdog and circulation
+    # controller it quiets are read when it runs, so it also works if
+    # shutdown comes before they are built.
+    watchdog: ACInfinityLinkWatchdog | None = None
+    circulation: CirculationController | None = None
+
+    async def _async_shutdown_release() -> None:
+        await _async_release_at_shutdown(
+            hass, entry.title, device, watchdog, circulation
+        )
+
+    entry.async_on_unload(
+        hass.async_add_shutdown_job(
+            HassJob(
+                _async_shutdown_release,
+                f"ac_infinity release BLE link {entry.title}",
+            )
+        )
+    )
+
     # Entries created before the option existed carry no options dict, so
     # the default decides for them; holding is the point of this integration
     # now (a fresh proxy connect per command costs 1.8-6.4 s).
@@ -193,28 +233,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # so the ordered call in async_unload_entry stays the normal route.
         entry.async_on_unload(device.async_stop_hold)
 
-    # Per-entry shutdown job. Home Assistant runs these in stage 1 of its stop
-    # (concurrently, before EVENT_HOMEASSISTANT_STOP), while the bluetooth
-    # stack and the proxy connections are still alive - the one moment a
-    # disconnect can still complete (see "Releasing the GATT link" below).
-    # Registered as soon as the link-holding object exists; the watchdog and
-    # circulation controller it quiets are read when it runs, so it also
-    # works if shutdown comes before they are built.
-    watchdog: ACInfinityLinkWatchdog | None = None
-    circulation: CirculationController | None = None
-
-    async def _async_shutdown_release() -> None:
-        await _async_release_at_shutdown(entry.title, device, watchdog, circulation)
-
-    entry.async_on_unload(
-        hass.async_add_shutdown_job(
-            HassJob(
-                _async_shutdown_release,
-                f"ac_infinity release BLE link {entry.title}",
-            )
-        )
-    )
-
     # Start listening BEFORE waiting: async_start registers the bluetooth
     # callback (which replays the current advertisement immediately when the
     # device is already known) and the unavailability tracker. Registered via
@@ -223,7 +241,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(coordinator.async_start())
 
     startup_timeout = HELD_STARTUP_TIMEOUT if hold else DEVICE_STARTUP_TIMEOUT
-    if not await coordinator.async_wait_ready(startup_timeout):
+    ready = await coordinator.async_wait_ready(startup_timeout)
+    # Rule B, after the await: shutdown can land while waiting, and what
+    # follows creates the watchdog (which could delete a real unreachable
+    # repair) and circulation. The job registered above has already latched
+    # the device and released the link, or will; this makes sure of both and
+    # leaves before any watcher exists and before any outage is recorded.
+    if shutting_down(hass) or device.closing:
+        await _async_stop_setup_for_shutdown(hass, entry, device)
+        raise ConfigEntryNotReady("Home Assistant is shutting down")
+    if not ready:
         if not hold:
             # Same outage, one step later: found once, silent since.
             async_link_down(hass, entry)
@@ -271,6 +298,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     watchdog.async_start()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Shutdown may have landed during the forward. The entry stays loaded
+    # (nothing to unwind, and its entities are restore-state); what must not
+    # happen is circulation starting on a fan that has just been released.
+    if shutting_down(hass) or device.closing:
+        await _async_stop_setup_for_shutdown(hass, entry, device)
+        watchdog.async_stop()
+        circulation.async_stop()
+        return True
     circulation.async_start()
 
     return True
@@ -399,6 +434,56 @@ RELEASE_LINK_SCHEMA = vol.Schema(
 )
 
 
+# hass.data[DOMAIN] keys that are not entry ids. Both outlive every entry
+# unload and reload; only a Home Assistant restart clears them.
+SHUTDOWN_LATCH_KEY = "shutting_down"
+RESUME_TIMERS_KEY = "release_link_resume_timers"
+
+
+def shutting_down(hass: HomeAssistant) -> bool:
+    """Whether Home Assistant has started its shutdown jobs.
+
+    ``hass.state`` is still ``running`` while they execute and ``is_stopping``
+    is still false, so neither can say; this process-lifetime latch can.
+    """
+    return bool(hass.data.get(DOMAIN, {}).get(SHUTDOWN_LATCH_KEY))
+
+
+@callback
+def _async_latch_shutdown(hass: HomeAssistant) -> None:
+    """Latch the whole domain shut and cancel every pending resume timer.
+
+    Home Assistant lists its shutdown jobs once, when stage 1 starts. An entry
+    set up (or reloaded) after that has a fresh device whose job is never in
+    the list, so a per-entry latch alone cannot keep it from opening a link:
+    this flag, set by the domain-lifetime job below and by every entry job,
+    is what makes ``async_setup_entry`` refuse. Idempotent.
+    """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data[SHUTDOWN_LATCH_KEY] = True
+    timers: list[Callable[[], None]] = domain_data.pop(RESUME_TIMERS_KEY, [])
+    for cancel in timers:
+        with contextlib.suppress(Exception):
+            cancel()
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the domain-lifetime shutdown latch, once per Home Assistant run.
+
+    Never removed when an entry unloads: it has to exist for the whole run so
+    that a reload or setup retry during stage 1 still finds the latch set.
+    A callback job, so it runs the moment stage 1 starts rather than on a
+    task the loop may schedule after an entry's setup.
+    """
+
+    @callback
+    def _latch() -> None:
+        _async_latch_shutdown(hass)
+
+    hass.async_add_shutdown_job(HassJob(_latch, "ac_infinity shutdown latch"))
+    return True
+
+
 async def _async_drop_link(name: str, device: ACInfinityDevice) -> bool:
     """Stop the hold, then force the disconnect; True when both went cleanly.
 
@@ -466,11 +551,18 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
 
     await asyncio.gather(*(_release(entry, data) for entry, data in targets))
 
-    if not targets or resume_after <= 0:
+    if not targets or resume_after <= 0 or shutting_down(hass):
         return
+
+    cancel_resume: Callable[[], None] | None = None
 
     async def _resume(_now: Any) -> None:
         """Rebuild the holds, for the restart that never came."""
+        timers = hass.data.get(DOMAIN, {}).get(RESUME_TIMERS_KEY)
+        if timers is not None and cancel_resume in timers:
+            timers.remove(cancel_resume)
+        if shutting_down(hass):
+            return  # Home Assistant is stopping; a link opened now is a ghost
         for entry, data in targets:
             # Identity, not membership. A RELOAD inside the window puts the
             # entry id straight back into hass.data with a NEW data/device, so
@@ -496,7 +588,13 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
             "No restart followed release_link within %s s; holds re-armed", resume_after
         )
 
-    async_call_later(hass, resume_after, _resume)
+    cancel_resume = async_call_later(hass, resume_after, _resume)
+    # Kept where the domain shutdown job can reach it: a timer that fires
+    # while Home Assistant is stopping must find the latch, and one still
+    # pending is cancelled outright.
+    hass.data.setdefault(DOMAIN, {}).setdefault(RESUME_TIMERS_KEY, []).append(
+        cancel_resume
+    )
 
 
 @callback
@@ -513,7 +611,23 @@ def _async_register_services(hass: HomeAssistant) -> None:
     )
 
 
+async def _async_stop_setup_for_shutdown(
+    hass: HomeAssistant, entry: ConfigEntry, device: ACInfinityDevice
+) -> None:
+    """Make sure a setup that shutdown overtook leaves no link behind.
+
+    The entry's own shutdown job normally did this already (it was registered
+    before setup's first await); doing it again is idempotent and covers a job
+    that has not run yet. Never raises.
+    """
+    _async_latch_shutdown(hass)
+    device.begin_closing()
+    await _async_release_link(entry.title, device)
+
+
+
 async def _async_release_at_shutdown(
+    hass: HomeAssistant,
     name: str,
     device: ACInfinityDevice,
     watchdog: ACInfinityLinkWatchdog | None,
@@ -528,7 +642,9 @@ async def _async_release_at_shutdown(
     """
     try:
         # Latch FIRST: from here nothing in this process may open a link to
-        # this fan again (hold supervisor, polls, commands, resume timer).
+        # this fan again (hold supervisor, polls, commands, resume timer), and
+        # no entry may be set up again (see _async_latch_shutdown).
+        _async_latch_shutdown(hass)
         device.begin_closing()
         # Then quiet the watchers in async_unload_entry's order, so the
         # deliberate disconnect is not recorded as an outage and no repair

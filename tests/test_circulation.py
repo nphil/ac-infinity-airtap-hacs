@@ -166,3 +166,27 @@ class TestWritesNothing:
             return device.writes
 
         assert asyncio.run(scenario()) == [4]
+
+
+class TestShutdownRefusal:
+    def test_a_write_refused_by_the_shutdown_latch_is_not_a_failure(self, caplog):
+        """Rule D: the fan was released on purpose; no warning, no retry fuss."""
+        import logging
+
+        from custom_components.ac_infinity.device import LinkClosingError
+
+        async def scenario():
+            hass = FakeHass("cooling")
+            device = FakeDevice(floor=0)
+
+            async def refuse(value: int) -> None:
+                raise LinkClosingError("shutting down")
+
+            device.async_set_min_speed = refuse
+            controller = CirculationController(hass, Settings(), device, lambda: None)
+            controller.async_start()
+            await settle(hass)
+
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(scenario())
+        assert not caplog.records

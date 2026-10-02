@@ -296,7 +296,7 @@ def test_a_hanging_disconnect_is_bounded_and_never_raises(monkeypatch, caplog):
 
     async def scenario():
         started = asyncio.get_running_loop().time()
-        await integration._async_release_at_shutdown("Vent", device, None, None)
+        await integration._async_release_at_shutdown(FakeHass(), "Vent", device, None, None)
         return asyncio.get_running_loop().time() - started
 
     with caplog.at_level(logging.WARNING):
@@ -310,7 +310,7 @@ def test_a_hanging_disconnect_is_bounded_and_never_raises(monkeypatch, caplog):
 def test_a_failing_disconnect_is_reported_and_never_raises(caplog):
     device = ExplodingDevice()
     with caplog.at_level(logging.WARNING):
-        asyncio.run(integration._async_release_at_shutdown("Vent", device, None, None))
+        asyncio.run(integration._async_release_at_shutdown(FakeHass(), "Vent", device, None, None))
     assert any("proxy went away" in r.getMessage() for r in caplog.records)
 
 
@@ -326,7 +326,7 @@ def test_a_watcher_that_raises_does_not_stop_the_release(setup_env):
         await settle()
         device = hass.data[DOMAIN]["one"].device
         await integration._async_release_at_shutdown(
-            "Vent", device, BrokenWatchdog(), None
+            hass, "Vent", device, BrokenWatchdog(), None
         )
         return device
 
@@ -590,3 +590,227 @@ def test_the_resume_timer_never_reopens_a_latched_fan():
         return started
 
     assert asyncio.run(scenario()) == []
+
+
+# ---------------------------------------------------------------------------
+# Addendum rules A-D: the latch outlives entries; setup refuses while latched
+# ---------------------------------------------------------------------------
+
+
+def run_domain_setup(hass):
+    asyncio.run(integration.async_setup(hass, {}))
+
+
+def test_a_the_domain_job_latches_and_cancels_pending_resume_timers():
+    """Rule A: one job per HA run; it is not tied to any entry's lifetime."""
+    hass = FakeHass()
+    run_domain_setup(hass)
+    cancelled = []
+    hass.data.setdefault(DOMAIN, {})[integration.RESUME_TIMERS_KEY] = [
+        lambda: cancelled.append("a"),
+        lambda: cancelled.append("b"),
+    ]
+    assert not integration.shutting_down(hass)
+    (job,) = hass.shutdown_jobs
+    job.target()
+    assert integration.shutting_down(hass)
+    assert cancelled == ["a", "b"]
+    assert integration.RESUME_TIMERS_KEY not in hass.data[DOMAIN]
+
+
+def test_a_the_domain_job_survives_entry_unload(setup_env):
+    async def scenario():
+        hass = FakeHass()
+        await integration.async_setup(hass, {})
+        entry = FakeEntry("one", hold=False)
+        await integration.async_setup_entry(hass, entry)
+        entry.unload()
+        return hass
+
+    hass = asyncio.run(scenario())
+    assert len(hass.shutdown_jobs) == 1, "only the domain latch job is left"
+
+
+def test_a_a_resume_timer_armed_by_release_link_is_cancelled_by_the_latch(monkeypatch):
+    monkeypatch.setattr(integration, "RELEASE_TIMEOUT", 1)
+
+    async def scenario():
+        hass = release_hass([SlowDevice(Group(1))])
+        hass.shutdown_jobs = []
+        hass.async_add_shutdown_job = lambda job: hass.shutdown_jobs.append(job)
+        await integration.async_setup(hass, {})
+        await integration._async_release_links(hass, 180)
+        armed = list(hass.pending_timers)
+        hass.shutdown_jobs[0].target()  # Stage 1 starts
+        return armed, list(hass.pending_timers)
+
+    armed, left = asyncio.run(scenario())
+    assert len(armed) == 1 and left == []
+
+
+def test_a_release_link_called_during_shutdown_arms_no_resume_timer(monkeypatch):
+    async def scenario():
+        hass = release_hass([SlowDevice(Group(1))])
+        hass.data[DOMAIN][integration.SHUTDOWN_LATCH_KEY] = True
+        await integration._async_release_links(hass, 180)
+        return getattr(hass, "pending_timers", [])
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_a_resume_timer_that_fires_during_shutdown_re_arms_nothing():
+    """The timer may fire after the latch even if cancelling it raced."""
+
+    async def scenario():
+        group = Group(1)
+        device = SlowDevice(group)
+        started = []
+        device.async_start_hold = lambda scanner_name=None: started.append(1)
+        hass = release_hass([device])
+        await integration._async_release_links(hass, 180)
+        hass.data[DOMAIN][integration.SHUTDOWN_LATCH_KEY] = True
+        (_delay, action), = hass.pending_timers
+        await action(None)
+        return started
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_b_setup_refuses_while_latched_and_builds_nothing(setup_env, monkeypatch):
+    """A retry or reload during Stage 1 must not make a fresh, unlatched device."""
+    outages = []
+    monkeypatch.setattr(integration, "async_link_down", lambda *a: outages.append(a))
+
+    async def scenario():
+        hass = FakeHass()
+        await integration.async_setup(hass, {})
+        hass.shutdown_jobs[0].target()
+        entry = FakeEntry("one", hold=True)
+        with pytest.raises(integration.ConfigEntryNotReady):
+            await integration.async_setup_entry(hass, entry)
+        await settle()
+        return hass, entry
+
+    hass, entry = asyncio.run(scenario())
+    assert setup_env.connects == [], "no hold, no connect"
+    assert "one" not in hass.data[DOMAIN]
+    assert len(hass.shutdown_jobs) == 1, "no per-entry job for a refused setup"
+    assert entry.unload_callbacks == []
+    assert outages == [], "a refused setup is not an outage"
+
+
+def test_b_a_reload_after_the_job_ran_is_refused_too(setup_env):
+    async def scenario():
+        hass = FakeHass()
+        await integration.async_setup(hass, {})
+        entry = FakeEntry("one", hold=True)
+        await integration.async_setup_entry(hass, entry)
+        await settle()
+        for job in list(hass.shutdown_jobs):
+            result = job.target()
+            if asyncio.iscoroutine(result):
+                await result
+        entry.unload()  # the reload's unload half
+        with pytest.raises(integration.ConfigEntryNotReady):
+            await integration.async_setup_entry(hass, entry)  # ... and its setup
+        await settle()
+
+    asyncio.run(scenario())
+    assert len(setup_env.connects) == 1, "only the original link was ever opened"
+
+
+def test_b_shutdown_during_wait_ready_creates_no_watchers_and_releases(
+    setup_env, monkeypatch
+):
+    """Rule B after the await, plus rule C: the job exists before any await."""
+    built = []
+    outages = []
+    monkeypatch.setattr(integration, "async_link_down", lambda *a: outages.append(a))
+    jobs_at_first_await = []
+    hass_holder = []
+
+    class Watchdog:
+        def __init__(self, *args) -> None:
+            built.append("watchdog")
+
+    class Circulation:
+        def __init__(self, *args) -> None:
+            built.append("circulation")
+
+    monkeypatch.setattr(integration, "ACInfinityLinkWatchdog", Watchdog)
+    monkeypatch.setattr(integration, "CirculationController", Circulation)
+
+    async def wait_ready(self, timeout) -> bool:
+        hass = hass_holder[0]
+        jobs_at_first_await.append(len(hass.shutdown_jobs))
+        await settle()  # the hold supervisor connects in the meantime
+        for job in list(hass.shutdown_jobs):  # Stage 1 lands mid-wait
+            await job.target()
+        return False  # would be the 'not advertising' branch for an unheld fan
+
+    monkeypatch.setattr(FakeCoordinator, "async_wait_ready", wait_ready)
+
+    async def scenario():
+        hass = FakeHass()
+        hass_holder.append(hass)
+        entry = FakeEntry("one", hold=False)
+        with pytest.raises(integration.ConfigEntryNotReady):
+            await integration.async_setup_entry(hass, entry)
+        return hass
+
+    hass = asyncio.run(scenario())
+    assert jobs_at_first_await == [1], "rule C: registered before the first await"
+    assert built == [], "no watchdog or circulation after the release"
+    assert outages == [], "shutdown is not an outage (and not a repair)"
+    assert "one" not in hass.data.get(DOMAIN, {})
+
+
+def test_b_shutdown_during_the_platform_forward_never_starts_circulation(
+    setup_env, monkeypatch
+):
+    started = []
+
+    class Circulation:
+        def __init__(self, *args) -> None:
+            pass
+
+        def async_start(self) -> None:
+            started.append("circulation")
+
+        def async_stop(self) -> None:
+            setup_env.watchers.log.append("circulation.async_stop")
+
+    monkeypatch.setattr(integration, "CirculationController", Circulation)
+
+    async def scenario():
+        hass = FakeHass()
+        entry = FakeEntry("one", hold=True)
+
+        async def forward(entry_, platforms) -> None:
+            await settle()
+            for job in list(hass.shutdown_jobs):
+                await job.target()
+
+        hass.config_entries.async_forward_entry_setups = forward
+        assert await integration.async_setup_entry(hass, entry)
+        await settle()
+        return hass.data[DOMAIN]["one"].device
+
+    device = asyncio.run(scenario())
+    assert started == []
+    assert device.closing and not device.is_connected
+    assert len(setup_env.connects) == 1
+
+
+def test_a_every_entry_job_also_sets_the_domain_latch(setup_env):
+    """release_link-style paths may have no domain job; the entry job covers it."""
+
+    async def scenario():
+        hass = FakeHass()
+        entry = FakeEntry("one", hold=False)
+        await integration.async_setup_entry(hass, entry)
+        assert not integration.shutting_down(hass)
+        await hass.shutdown_jobs[0].target()
+        return integration.shutting_down(hass)
+
+    assert asyncio.run(scenario()) is True

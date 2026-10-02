@@ -41,7 +41,7 @@ from homeassistant.helpers.event import (async_call_later,
 
 from .const import (CONF_CIRCULATION_HOLD, CONF_CIRCULATION_SPEED,
                     CONF_REST_SPEED, CONF_THERMOSTAT, DEFAULT_CIRCULATION_HOLD)
-from .device import WORK_TYPE_AUTO, ACInfinityDevice
+from .device import WORK_TYPE_AUTO, ACInfinityDevice, LinkClosingError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -232,6 +232,10 @@ class CirculationController:
         try:
             await self._device.async_set_min_speed(target)
             _LOGGER.debug("%s: minimum set to %s", self._device.name, target)
+        except LinkClosingError:
+            # Home Assistant is shutting down and the fan has been released:
+            # a refusal, not a failure worth a warning or a retry.
+            _LOGGER.debug("%s: minimum write refused; shutting down", self._device.name)
         except Exception as err:  # noqa: BLE001 - retried on a later check
             _LOGGER.warning(
                 "%s: could not set the minimum to %s: %s", self._device.name, target, err
