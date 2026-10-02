@@ -1,8 +1,10 @@
 release_link:
-  # Home Assistant does not unload config entries on shutdown, so a restart
-  # drops held GATT links without completing a disconnect. The fan keeps
-  # believing it is connected, stops advertising, and only a proxy reboot
-  # frees it. Call this first, then restart.
+  # Home Assistant does not unload config entries on shutdown, and its
+  # Bluetooth stack closes while integrations are still disconnecting, which
+  # used to leave a ghost link only a proxy reboot freed. Each entry now
+  # registers a shutdown job that releases its link before that happens, so a
+  # restart no longer needs this action; it remains the manual way to free a
+  # stuck link. Entries are released concurrently, each limited to 8 s.
   fields:
     resume_after:
       required: false

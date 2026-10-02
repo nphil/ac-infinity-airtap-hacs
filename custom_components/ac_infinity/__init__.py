@@ -7,9 +7,11 @@ must keep _device_info_from_entry_data able to read every historical shape.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import logging
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -19,7 +21,7 @@ import voluptuous as vol
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_SERVICE_DATA, Platform
-from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.core import HassJob, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_call_later
@@ -191,6 +193,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # so the ordered call in async_unload_entry stays the normal route.
         entry.async_on_unload(device.async_stop_hold)
 
+    # Per-entry shutdown job. Home Assistant runs these in stage 1 of its stop
+    # (concurrently, before EVENT_HOMEASSISTANT_STOP), while the bluetooth
+    # stack and the proxy connections are still alive - the one moment a
+    # disconnect can still complete (see "Releasing the GATT link" below).
+    # Registered as soon as the link-holding object exists; the watchdog and
+    # circulation controller it quiets are read when it runs, so it also
+    # works if shutdown comes before they are built.
+    watchdog: ACInfinityLinkWatchdog | None = None
+    circulation: CirculationController | None = None
+
+    async def _async_shutdown_release() -> None:
+        await _async_release_at_shutdown(entry.title, device, watchdog, circulation)
+
+    entry.async_on_unload(
+        hass.async_add_shutdown_job(
+            HassJob(
+                _async_shutdown_release,
+                f"ac_infinity release BLE link {entry.title}",
+            )
+        )
+    )
+
     # Start listening BEFORE waiting: async_start registers the bluetooth
     # callback (which replays the current advertisement immediately when the
     # device is already known) and the unavailability tracker. Registered via
@@ -328,7 +352,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# release_link - a clean teardown before a Home Assistant restart
+# Releasing the GATT link: at shutdown, and on demand (release_link)
 # ---------------------------------------------------------------------------
 #
 # Home Assistant does NOT unload config entries on shutdown: it fires
@@ -345,11 +369,16 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 # The living-room fan wedged exactly four minutes after that restart and only a
 # proxy reboot freed it.
 #
-# The ordering inside HA's shutdown cannot be fixed from outside, so the
-# teardown has to happen BEFORE the restart is requested. This action does that
+# The fix is the shutdown job each entry registers in async_setup_entry. Home
+# Assistant runs those in "stage 1" of its stop, BEFORE it fires
+# EVENT_HOMEASSISTANT_STOP, while the bluetooth stack and the proxies are still
+# alive; every job runs concurrently under one shared 20 s budget, so each fan
+# gets its own job and its own 8 s bound.
+#
+# `release_link` below predates that and does the same teardown on request,
 # for every loaded entry, and re-arms the hold afterwards so an operator who
 # calls it and then does not restart - or a restart that fails - is not left
-# with disconnected fans.
+# with disconnected fans. It stays as the manual way to free a stuck link.
 SERVICE_RELEASE_LINK = "release_link"
 ATTR_RESUME_AFTER = "resume_after"
 #: Seconds before the hold is rebuilt if no restart took the process away.
@@ -357,6 +386,10 @@ ATTR_RESUME_AFTER = "resume_after"
 #: short enough that a mistaken call heals itself well inside the
 #: 15-minute unreachable window.
 DEFAULT_RESUME_AFTER = 180
+#: Seconds one fan gets to let go of its link, at shutdown or in
+#: release_link. Well inside Home Assistant's shared 20 s stage-1 budget.
+RELEASE_TIMEOUT = 8
+
 RELEASE_LINK_SCHEMA = vol.Schema(
     {
         vol.Optional(ATTR_RESUME_AFTER, default=DEFAULT_RESUME_AFTER): vol.All(
@@ -366,29 +399,79 @@ RELEASE_LINK_SCHEMA = vol.Schema(
 )
 
 
+async def _async_drop_link(name: str, device: ACInfinityDevice) -> bool:
+    """Stop the hold, then force the disconnect; True when both went cleanly.
+
+    The supervisor stops FIRST, exactly as async_unload_entry does: a teardown
+    underneath a live supervisor looks like a lost link and it immediately
+    rebuilds the connection we are releasing. A failure of the first step must
+    not skip the second, so each is caught on its own. Never raises (except
+    for cancellation).
+    """
+    clean = True
+    for step in (device.async_stop_hold, device.stop):
+        try:
+            await step()
+        except Exception as err:  # noqa: BLE001 - release must always go on
+            clean = False
+            _LOGGER.warning(
+                "%s: error while releasing the BLE link (%s): %s",
+                name,
+                step.__name__,
+                err,
+            )
+    return clean
+
+
+async def _async_release_link(name: str, device: ACInfinityDevice) -> float | None:
+    """Release one fan's link within RELEASE_TIMEOUT.
+
+    Returns the seconds it took, or None when it timed out or hit an error
+    (already logged as a warning). Never raises, so a caller can gather any
+    number of these and one slow fan cannot hold up or fail the others.
+    """
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(RELEASE_TIMEOUT):
+            clean = await _async_drop_link(name, device)
+    except TimeoutError:
+        _LOGGER.warning(
+            "Releasing the BLE link to %s did not finish within %s s; giving up",
+            name,
+            RELEASE_TIMEOUT,
+        )
+        return None
+    return time.monotonic() - started if clean else None
+
+
 async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
-    """Drop every held GATT link cleanly, then re-arm the holds."""
-    released: list[tuple[ConfigEntry, ACInfinityData]] = []
+    """Drop every held GATT link cleanly, then re-arm the holds.
+
+    Entries are released concurrently, each under its own RELEASE_TIMEOUT:
+    done one after another, a single slow fan once held four others for ~20 s
+    (live, 2026-10-02).
+    """
+    targets: list[tuple[ConfigEntry, ACInfinityData]] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
         data: ACInfinityData | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-        if data is None:
-            continue
-        # Stop the supervisor first, exactly as async_unload_entry does: a
-        # teardown underneath a live supervisor looks like a lost link and it
-        # immediately rebuilds the connection we are releasing.
-        with contextlib.suppress(Exception):
-            await data.device.async_stop_hold()
-        with contextlib.suppress(Exception):
-            await data.device.stop()
-        released.append((entry, data))
-        _LOGGER.info("Released the BLE link held for %s", entry.title)
+        if data is not None:
+            targets.append((entry, data))
 
-    if not released or resume_after <= 0:
+    async def _release(entry: ConfigEntry, data: ACInfinityData) -> None:
+        elapsed = await _async_release_link(entry.title, data.device)
+        if elapsed is not None:
+            _LOGGER.info(
+                "Released the BLE link held for %s in %.2f s", entry.title, elapsed
+            )
+
+    await asyncio.gather(*(_release(entry, data) for entry, data in targets))
+
+    if not targets or resume_after <= 0:
         return
 
     async def _resume(_now: Any) -> None:
         """Rebuild the holds, for the restart that never came."""
-        for entry, data in released:
+        for entry, data in targets:
             # Identity, not membership. A RELOAD inside the window puts the
             # entry id straight back into hass.data with a NEW data/device, so
             # "is it still there" passes - and re-arming the captured OLD
@@ -400,6 +483,8 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
             # the winner can flip whenever the fan re-advertises.
             if hass.data.get(DOMAIN, {}).get(entry.entry_id) is not data:
                 continue  # unloaded or reloaded meanwhile; it owns itself now
+            if data.device.closing:
+                continue  # Home Assistant is shutting down; never reconnect
             if not entry.options.get(CONF_HOLD_CONNECTION, DEFAULT_HOLD_CONNECTION):
                 continue
             address: str = entry.data[CONF_ADDRESS]
@@ -426,3 +511,39 @@ def _async_register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN, SERVICE_RELEASE_LINK, _handle, schema=RELEASE_LINK_SCHEMA
     )
+
+
+async def _async_release_at_shutdown(
+    name: str,
+    device: ACInfinityDevice,
+    watchdog: ACInfinityLinkWatchdog | None,
+    circulation: CirculationController | None,
+) -> None:
+    """Let go of one fan's link while Home Assistant is shutting down.
+
+    Run as a Home Assistant shutdown job (stage 1, before the bluetooth stack
+    and the proxy connections close). The entry is NOT unloaded and no entity
+    is removed: restore-state stays intact and no wave of ``unavailable``
+    states is written. Never raises.
+    """
+    try:
+        # Latch FIRST: from here nothing in this process may open a link to
+        # this fan again (hold supervisor, polls, commands, resume timer).
+        device.begin_closing()
+        # Then quiet the watchers in async_unload_entry's order, so the
+        # deliberate disconnect is not recorded as an outage and no repair
+        # issue is created or deleted. A watcher that raises must not skip
+        # the release below.
+        if watchdog is not None:
+            with contextlib.suppress(Exception):
+                watchdog.async_stop()
+        if circulation is not None:
+            with contextlib.suppress(Exception):
+                circulation.async_stop()
+        elapsed = await _async_release_link(name, device)
+        if elapsed is not None:
+            _LOGGER.info(
+                "Released BLE link to %s at shutdown in %.2f s", name, elapsed
+            )
+    except Exception as err:  # noqa: BLE001 - a shutdown job must never raise
+        _LOGGER.warning("Could not release the BLE link to %s at shutdown: %s", name, err)

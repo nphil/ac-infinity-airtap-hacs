@@ -72,7 +72,7 @@ from .ac_infinity_ble.const import MANUFACTURER_ID, CallbackType
 from .ac_infinity_ble.exceptions import CharacteristicMissingError
 from .ac_infinity_ble.models import DeviceInfo
 from .const import CONF_LAST_HOLDING_PROXY, DOMAIN
-from .device import ACInfinityDevice
+from .device import ACInfinityDevice, LinkClosingError
 from .hold import allocation_source_for_address
 
 if TYPE_CHECKING:
@@ -554,6 +554,7 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         # when there is actually a connectable path to the device right now.
         return (
             self.hass.state is CoreState.running
+            and not self.controller.closing
             and self.controller.update_needed(seconds_since_last_poll)
             and bool(
                 bluetooth.async_ble_device_from_address(
@@ -577,7 +578,11 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         worth anything on an established link — connecting is what the hold
         supervisor is for — so a down link is simply skipped, not forced.
         """
-        if self.hass.is_stopping or not self.controller.is_connected:
+        if (
+            self.hass.is_stopping
+            or self.controller.closing
+            or not self.controller.is_connected
+        ):
             return
         if self._link_poll_task is not None and not self._link_poll_task.done():
             return
@@ -598,6 +603,8 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         answer a read is already reported as a drop by the hold supervisor,
         and the next tick retries.
         """
+        if self.controller.closing:
+            return
         try:
             await self._async_update()
         except BleakError as exc:
@@ -632,6 +639,10 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
             async with _POLL_SEMAPHORE:
                 async with asyncio.timeout(POLL_TIMEOUT):
                     await self.controller.update()
+        except LinkClosingError:
+            # The shutdown job latched this fan after the poll was already
+            # queued (hass.state is still ``running`` then); nothing to do.
+            return
         except CharacteristicMissingError:
             # Transient: a proxy handed us a cached-but-stale service table.
             # bleak-retry-connector re-resolves on the next attempt, and the

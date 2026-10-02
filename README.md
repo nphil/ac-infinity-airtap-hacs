@@ -132,6 +132,15 @@ Devices & Services → Add integration → AC Infinity Airtap*.
 
 ## Troubleshooting
 
+### Restarting Home Assistant
+
+Each fan releases its Bluetooth link on its own when Home Assistant shuts
+down (UI restart, update, reboot), so the ESPHome proxy never keeps a
+"ghost" link that blocks the fan afterwards. Nothing needs to be called first.
+The `ac_infinity.release_link` action still exists to free a stuck link
+without restarting: it releases all fans at the same time, each limited to
+8 seconds, and rebuilds the links after `resume_after` seconds.
+
 ### Debug logging
 
 ```yaml

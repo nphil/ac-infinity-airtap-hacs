@@ -52,7 +52,7 @@
   "services": {
     "release_link": {
       "name": "Release link",
-      "description": "Cleanly drops the Bluetooth link this integration holds to every configured fan, then re-establishes it after a delay. Call this immediately before restarting Home Assistant: Home Assistant tears its Bluetooth stack down while integrations are still releasing, so a restart leaves the fan believing it is still connected and it stops advertising until its proxy is rebooted.",
+      "description": "Cleanly drops the Bluetooth link this integration holds to every configured fan, then re-establishes it after a delay. Home Assistant now releases every link by itself when it shuts down, so a restart no longer needs this; use it to free a link that is stuck without restarting. The links are released at the same time, each limited to 8 seconds.",
       "fields": {
         "resume_after": {
           "name": "Resume after",

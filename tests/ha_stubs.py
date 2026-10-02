@@ -173,6 +173,13 @@ def install() -> bool:
         def __init__(self, data=None):
             self.data = data or {}
 
+    class HassJob:
+        """A named callable, as ``hass.async_add_shutdown_job`` receives it."""
+
+        def __init__(self, target, name=None) -> None:
+            self.target = target
+            self.name = name
+
     class CoreState(Enum):
         running = "RUNNING"
         not_running = "NOT_RUNNING"
@@ -181,6 +188,7 @@ def install() -> bool:
     core.HomeAssistant = HomeAssistant
     core.ServiceCall = ServiceCall
     core.CoreState = CoreState
+    core.HassJob = HassJob
 
     class State:
         """Just the fields the integration reads off a state."""

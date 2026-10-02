@@ -19,6 +19,7 @@ class FakeDevice:
     def __init__(self) -> None:
         self.hold_starts = 0
         self.stopped = False
+        self.closing = False
 
     async def async_stop_hold(self) -> None:
         pass

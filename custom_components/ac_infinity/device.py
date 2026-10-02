@@ -202,6 +202,16 @@ class AutoModeConfig:
     low_temp_f: Optional[int] = None
 
 
+class LinkClosingError(Exception):
+    """Raised when something asks a shutting-down device to open a link.
+
+    Deliberately not a ``BleakError`` and not ``CharacteristicMissingError``:
+    the vendored retry decorator and the coordinator's transient-error
+    handling both retry or swallow those, and a refused connect must stop the
+    attempt, not be tried again.
+    """
+
+
 class ACInfinityDevice(ACInfinityController):
     """Controller with AUTO-mode support and optimistic local state."""
 
@@ -235,6 +245,35 @@ class ACInfinityDevice(ACInfinityController):
         self._hold_wake = asyncio.Event()
         self._cancel_drop_callback: Callable[[], None] | None = None
         self._hold_scanner_name: Callable[[], str | None] | None = None
+        self._closing = False
+
+    @property
+    def closing(self) -> bool:
+        """True once ``begin_closing`` ran; it never goes back to False."""
+        return self._closing
+
+    def begin_closing(self) -> None:
+        """Latch the device shut for the rest of this process.
+
+        Called first by the shutdown job (see ``__init__.py``).  From then on
+        every route to a connection refuses: the hold supervisor and
+        ``async_start_hold``, the coordinator's polls, and any command, all of
+        which connect through ``_ensure_connected``.  Home Assistant's
+        ``hass.state`` is still ``running`` while shutdown jobs run, so the
+        flag has to live here rather than be inferred from it.
+        """
+        self._closing = True
+
+    async def _ensure_connected(self) -> None:
+        """Connect unless the device has been latched shut."""
+        if self._closing:
+            raise LinkClosingError(f"{self.name} is shutting down")
+        await super()._ensure_connected()
+        if self._closing:
+            # The latch landed while this connect was in flight: the link it
+            # just opened is exactly the one the shutdown job cannot see.
+            await self._execute_disconnect(force=True)
+            raise LinkClosingError(f"{self.name} is shutting down")
 
     @property
     def hold_status(self) -> HoldStatus:
@@ -252,6 +291,9 @@ class ACInfinityDevice(ACInfinityController):
         the log line; it is injected because naming a scanner needs Home
         Assistant and this module stays HA-free.
         """
+        if self._closing:
+            _LOGGER.debug("%s: Not holding a link; shutting down", self.name)
+            return
         if self._hold_task is not None:
             return
         self._hold_scanner_name = scanner_name
@@ -324,12 +366,16 @@ class ACInfinityDevice(ACInfinityController):
             self._hold_status.set_reconnect_attempt(attempt)
             if not first_connect:
                 await asyncio.sleep(backoff_delay(attempt))
+            if self._closing:
+                return
             first_connect = False
             self._hold_wake.clear()
             try:
                 await self._ensure_connected()
             except asyncio.CancelledError:
                 raise
+            except LinkClosingError:
+                return
             except Exception as ex:  # noqa: BLE001 - the hold never dies
                 if attempt % HOLD_FAILURE_LOG_EVERY == 0:
                     _LOGGER.warning(
