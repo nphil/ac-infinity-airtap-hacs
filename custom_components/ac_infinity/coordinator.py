@@ -522,9 +522,18 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         the direct result of _async_handle_bluetooth_event below, whose
         super() call already notifies listeners — forwarding them again would
         double-render every advertisement.
+
+        Anything else is the fan answering over a live GATT link, which proves
+        it reachable and fills its state exactly as a parseable advertisement
+        does, so it also ends ``async_wait_ready``.  A held AIRTAP rarely
+        advertises, so on a restart this is what normally ends that wait:
+        before it counted, the advertisement-only wait ran its full
+        DEVICE_STARTUP_TIMEOUT on every restart (measured 2026-10-02: 30.02 s,
+        the single longest item in Home Assistant's startup).
         """
         if change is CallbackType.ADVERTISEMENT:
             return
+        self._device_ready.set()
         self.async_update_listeners()
 
     @callback
@@ -730,7 +739,8 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         self._async_notify_health()
 
     async def async_wait_ready(self) -> bool:
-        """Wait for the first parseable advertisement after start."""
+        """Wait for the fan's first state after start: a parseable
+        advertisement or, over a held link, a notification or poll response."""
         with contextlib.suppress(TimeoutError):
             async with asyncio.timeout(DEVICE_STARTUP_TIMEOUT):
                 await self._device_ready.wait()

@@ -24,6 +24,7 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
+from custom_components.ac_infinity.ac_infinity_ble.const import CallbackType
 from custom_components.ac_infinity.coordinator import ACInfinityDataUpdateCoordinator
 from custom_components.ac_infinity.device import ACInfinityDevice, DeviceInfoEx
 from tests.conftest import build_manufacturer_data
@@ -87,6 +88,24 @@ class TestEveryFrameReachesBase:
         assert not coordinator._device_ready.is_set()
         coordinator._async_handle_bluetooth_event(aci_frame(), CHANGE)
         assert coordinator._device_ready.is_set()
+
+    def test_state_over_the_held_link_marks_device_ready(self):
+        """A held fan rarely advertises; its first notification or poll
+        response must end the startup wait, or every restart sits out the
+        full DEVICE_STARTUP_TIMEOUT (30 s, measured 2026-10-02)."""
+        for change in (CallbackType.NOTIFICATION, CallbackType.UPDATE_RESPONSE):
+            coordinator, device = make_coordinator()
+            coordinator._async_handle_controller_push(device.state, change)
+            assert coordinator._device_ready.is_set(), change
+
+    def test_advertisement_push_alone_does_not_mark_ready(self):
+        """The controller's ADVERTISEMENT echo is ignored; readiness from an
+        advertisement is decided by the parseable-frame path above."""
+        coordinator, device = make_coordinator()
+        coordinator._async_handle_controller_push(
+            device.state, CallbackType.ADVERTISEMENT
+        )
+        assert not coordinator._device_ready.is_set()
 
 
 class TestUnavailability:

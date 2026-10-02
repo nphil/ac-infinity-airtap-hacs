@@ -206,14 +206,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "check ESPHome proxy coverage"
             )
         # A held AIRTAP advertises rarely, and right after a restart a proxy
-        # may still own the previous link, so a 30 s window regularly misses
-        # the manufacturer-data frame (all six fans failed setup this way on
-        # 2026-09-09). The connectable path above is proof enough: the hold
-        # supervisor connects and the first GATT poll/notification fills the
+        # may still own the previous link, so the manufacturer-data frame
+        # regularly misses this window (all six fans failed setup this way on
+        # 2026-09-09). The held link normally ends the wait first: its first
+        # notification or poll response counts as ready too. Reaching here
+        # means neither arrived in time; the connectable path above is proof
+        # enough, the hold supervisor keeps connecting and GATT fills the
         # state in; entities stay unavailable until then, which is honest.
         _LOGGER.info(
-            "%s (%s): no parseable advertisement within %ss; holding the link "
-            "and taking state from GATT instead",
+            "%s (%s): no state from an advertisement or the held link within "
+            "%ss; holding the link and taking state from GATT when it arrives",
             entry.title,
             address,
             DEVICE_STARTUP_TIMEOUT,
