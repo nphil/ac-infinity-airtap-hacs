@@ -79,6 +79,12 @@ if TYPE_CHECKING:
     from .models import ACInfinityData
 
 DEVICE_STARTUP_TIMEOUT = 30
+# The same wait for a held fan, which never refuses setup on a miss (the hold
+# supervisor keeps connecting and GATT fills the state in), so a miss only
+# costs Home Assistant's startup time. Measured on the 2026-10-02 restart:
+# four links delivered state 4-7 s into setup, two only after 29 and 32 s of
+# connect retries; under the full 30 s every restart waited on the slowest.
+HELD_STARTUP_TIMEOUT = 10
 
 # Upper bound for one GATT poll (connect + subscribe + command + response).
 # bleak-retry-connector has its own per-attempt timeouts, but the worst-case
@@ -738,11 +744,12 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         )
         self._async_notify_health()
 
-    async def async_wait_ready(self) -> bool:
-        """Wait for the fan's first state after start: a parseable
-        advertisement or, over a held link, a notification or poll response."""
+    async def async_wait_ready(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` s for the fan's first state after start: a
+        parseable advertisement or, over a held link, a notification or poll
+        response."""
         with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(DEVICE_STARTUP_TIMEOUT):
+            async with asyncio.timeout(timeout):
                 await self._device_ready.wait()
                 return True
         return False

@@ -35,6 +35,7 @@ from .const import (
 )
 from .coordinator import (
     DEVICE_STARTUP_TIMEOUT,
+    HELD_STARTUP_TIMEOUT,
     ACInfinityDataUpdateCoordinator,
     ACInfinityLinkWatchdog,
     async_clear_outage,
@@ -197,7 +198,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # callbacks down before the retry.
     entry.async_on_unload(coordinator.async_start())
 
-    if not await coordinator.async_wait_ready():
+    startup_timeout = HELD_STARTUP_TIMEOUT if hold else DEVICE_STARTUP_TIMEOUT
+    if not await coordinator.async_wait_ready(startup_timeout):
         if not hold:
             # Same outage, one step later: found once, silent since.
             async_link_down(hass, entry)
@@ -218,7 +220,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "%ss; holding the link and taking state from GATT when it arrives",
             entry.title,
             address,
-            DEVICE_STARTUP_TIMEOUT,
+            startup_timeout,
         )
 
     watchdog = ACInfinityLinkWatchdog(hass, entry, coordinator)
