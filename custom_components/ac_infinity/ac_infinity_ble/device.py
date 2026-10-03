@@ -52,6 +52,7 @@ from bleak.exc import BleakDBusError
 from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
+    BleakConnectionError,
     BleakError,
     BleakNotFoundError,
     establish_connection,
@@ -77,6 +78,18 @@ DEFAULT_ATTEMPTS = 3
 # Devices normally answer well under a second; five seconds tolerates a
 # congested proxy without stalling the coordinator for long.
 NOTIFY_TIMEOUT = 5
+# No single step of bringing a link up (the whole ``establish_connection``,
+# the notification subscribe) or of letting one go (``stop_notify``,
+# ``disconnect``) may hang longer than this.  bleak-retry-connector alone
+# allows 20 s per attempt, up to 60 s, and nothing bounds ``start_notify`` at
+# all: on 2026-10-02 another fleet integration's first link stalled 20 s on
+# the subscribe and then connected in 1.7 s on retry.  A step cut off here is
+# a failed attempt like any other: the caller's retry ladder takes over.
+LINK_STEP_TIMEOUT = 10
+# stop_notify is only courtesy before the disconnect that actually frees the
+# proxy slot, so it gets less: a hung one must not eat the whole shutdown
+# budget (8 s) before the disconnect is even tried.
+STOP_NOTIFY_TIMEOUT = 3
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -121,6 +134,12 @@ class ACInfinityController:
         self._last_advertisement_monotonic: float | None = None
         self._hold_connection = False
         self._disconnect_callbacks: list[Callable[[], None]] = []
+        # Told when a freshly connected link stalls on its notification
+        # subscribe, so the owner can steer the next attempt to a different
+        # path; set by the integration, None for a bare library user.
+        self._on_stalled_link: Callable[[BleakClientWithServiceCache], None] | None = (
+            None
+        )
         if advertisement_data is not None:
             # Being handed an advertisement at construction means one was
             # just seen (or HA's scanner cache holds a recent one); without
@@ -450,14 +469,23 @@ class ACInfinityController:
                 self._reset_disconnect_timer()
                 return
             _LOGGER.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
-            client = await establish_connection(
-                self._client_class,
-                self._ble_device,
-                self.name,
-                self._disconnected,
-                use_services_cache=True,
-                ble_device_callback=lambda: self._ble_device,
-            )
+            try:
+                async with asyncio.timeout(LINK_STEP_TIMEOUT):
+                    client = await establish_connection(
+                        self._client_class,
+                        self._ble_device,
+                        self.name,
+                        self._disconnected,
+                        use_services_cache=True,
+                        ble_device_callback=lambda: self._ble_device,
+                    )
+            except TimeoutError as ex:
+                # A BleakError, not the TimeoutError: the retry decorator
+                # deliberately never retries a bare timeout, and the callers
+                # treat every BleakError as an ordinary failed attempt.
+                raise BleakConnectionError(
+                    f"{self.name}: no connection within {LINK_STEP_TIMEOUT} s"
+                ) from ex
             _LOGGER.debug("%s: Connected; RSSI: %s", self.name, self.rssi)
             if not self._resolve_characteristics(client.services):
                 # A stale service cache (firmware update, proxy quirk) can
@@ -475,15 +503,26 @@ class ACInfinityController:
                 self._write_char = None
                 await client.clear_cache()
                 self._expected_disconnect = True
-                await client.disconnect()
+                await self._disconnect_unpublished(client)
                 raise CharacteristicMissingError(
                     "Failed to resolve read/write characteristics"
                 )
             _LOGGER.debug(
                 "%s: Subscribe to notifications; RSSI: %s", self.name, self.rssi
             )
+            stalled = False
             try:
-                await client.start_notify(self._read_char, self._notification_handler)
+                try:
+                    async with asyncio.timeout(LINK_STEP_TIMEOUT):
+                        await client.start_notify(
+                            self._read_char, self._notification_handler
+                        )
+                except TimeoutError as ex:
+                    stalled = True
+                    raise BleakConnectionError(
+                        f"{self.name}: notification subscribe did not finish "
+                        f"within {LINK_STEP_TIMEOUT} s"
+                    ) from ex
             except BLEAK_EXCEPTIONS:
                 # Subscribing can fail transiently on a fresh link; drop the
                 # connection so the retry layer reconnects cleanly instead of
@@ -492,12 +531,43 @@ class ACInfinityController:
                 self._read_char = None
                 self._write_char = None
                 self._expected_disconnect = True
-                await client.disconnect()
+                if stalled and self._on_stalled_link is not None:
+                    try:
+                        self._on_stalled_link(client)
+                    except Exception:  # noqa: BLE001 - advisory hook only
+                        _LOGGER.debug(
+                            "%s: stalled-link hook failed", self.name, exc_info=True
+                        )
+                await self._disconnect_unpublished(client)
                 raise
             # Publish the client only once it is fully usable, so no other
             # coroutine can observe a connection without notifications.
             self._client = client
             self._reset_disconnect_timer()
+
+    async def _disconnect_unpublished(self, client: BleakClientWithServiceCache) -> None:
+        """Drop a client whose setup failed, without waiting on it for long.
+
+        Runs inside the connect lock, so a disconnect that never returns would
+        block every later connect attempt for this fan.  A timeout is logged
+        and swallowed; the failure that brought us here is what gets raised.
+        """
+        try:
+            async with asyncio.timeout(LINK_STEP_TIMEOUT):
+                await client.disconnect()
+        except TimeoutError:
+            _LOGGER.warning(
+                "%s: Disconnect of a failed connection attempt did not finish "
+                "within %s s",
+                self.name,
+                LINK_STEP_TIMEOUT,
+            )
+
+    def set_stalled_link_handler(
+        self, handler: Callable[[BleakClientWithServiceCache], None] | None
+    ) -> None:
+        """Be told when a new link stalls on its notification subscribe."""
+        self._on_stalled_link = handler
 
     def _notification_handler(
         self, _sender: BleakGATTCharacteristic, data: bytearray
@@ -641,10 +711,11 @@ class ACInfinityController:
             if client and client.is_connected:
                 if read_char:
                     try:
-                        await client.stop_notify(read_char)
+                        async with asyncio.timeout(STOP_NOTIFY_TIMEOUT):
+                            await client.stop_notify(read_char)
                     except BLEAK_EXCEPTIONS:
-                        # A dying link often fails stop_notify; the
-                        # disconnect below must still run or the proxy
+                        # A dying link often fails (or hangs on) stop_notify;
+                        # the disconnect below must still run or the proxy
                         # connection slot leaks until the supervisor times
                         # it out.
                         _LOGGER.debug(
@@ -653,7 +724,8 @@ class ACInfinityController:
                             exc_info=True,
                         )
                 try:
-                    await client.disconnect()
+                    async with asyncio.timeout(LINK_STEP_TIMEOUT):
+                        await client.disconnect()
                 except BLEAK_EXCEPTIONS:
                     _LOGGER.debug(
                         "%s: Error during disconnect", self.name, exc_info=True

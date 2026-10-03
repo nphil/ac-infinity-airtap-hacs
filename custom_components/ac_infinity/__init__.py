@@ -37,8 +37,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import (
-    DEVICE_STARTUP_TIMEOUT,
-    HELD_STARTUP_TIMEOUT,
+    STARTUP_BUDGET,
     ACInfinityDataUpdateCoordinator,
     ACInfinityLinkWatchdog,
     async_clear_outage,
@@ -136,6 +135,22 @@ def _runtime_state_from_entry_data(service_data: Any) -> DeviceInfoEx:
     )
 
 
+def _record_stalled_link(client: Any) -> None:
+    """Count a stalled subscribe against the proxy that carried the link.
+
+    The connect itself succeeded, so habluetooth already cleared that
+    proxy's failure count for this fan; without this the next attempt would
+    score the same path as spotless. Best effort on habluetooth internals
+    (the same ones ble_affinity.py relies on): when they are absent the
+    one-shot bypass of the preferred proxy still applies.
+    """
+    scanner = getattr(client, "_connected_scanner", None)
+    record = getattr(scanner, "_add_connect_failure", None)
+    address = getattr(client, "address", None)
+    if callable(record) and address:
+        record(address)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up AC Infinity from a config entry."""
     _async_register_services(hass)
@@ -165,6 +180,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     device_info = _runtime_state_from_entry_data(entry.data[CONF_SERVICE_DATA])
 
+    # One-shot: after a link stalled on its notification subscribe, the next
+    # connect ignores the preferred proxy (see _on_stalled_link).
+    skip_preferred = False
+
+    def _preferred_proxy() -> str | None:
+        nonlocal skip_preferred
+        if skip_preferred:
+            skip_preferred = False
+            return None
+        return entry.options.get(CONF_PREFERRED_PROXY) or None
+
+    def _on_stalled_link(client: Any) -> None:
+        nonlocal skip_preferred
+        skip_preferred = True
+        _record_stalled_link(client)
+
     def _on_proxy_choice(_scanner_name: str, preferred_used: bool) -> None:
         device.hold_status.set_via_preferred_proxy(preferred_used)
 
@@ -177,10 +208,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # this class.
     client_class = make_affinity_client_class(
         bleak_retry_connector.BleakClientWithServiceCache,
-        lambda: entry.options.get(CONF_PREFERRED_PROXY) or None,
+        _preferred_proxy,
         on_choice=_on_proxy_choice,
     )
     device = ACInfinityDevice(ble_device, device_info, client_class=client_class)
+    device.set_stalled_link_handler(_on_stalled_link)
     device.hold_status.set_preferred_proxy(
         entry.options.get(CONF_PREFERRED_PROXY) or None
     )
@@ -240,8 +272,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # callbacks down before the retry.
     entry.async_on_unload(coordinator.async_start())
 
-    startup_timeout = HELD_STARTUP_TIMEOUT if hold else DEVICE_STARTUP_TIMEOUT
-    ready = await coordinator.async_wait_ready(startup_timeout)
+    ready = await coordinator.async_wait_ready(STARTUP_BUDGET)
     # Rule B, after the await: shutdown can land while waiting, and what
     # follows creates the watchdog (which could delete a real unreachable
     # repair) and circulation. The job registered above has already latched
@@ -251,27 +282,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _async_stop_setup_for_shutdown(hass, entry, device)
         raise ConfigEntryNotReady("Home Assistant is shutting down")
     if not ready:
-        if not hold:
-            # Same outage, one step later: found once, silent since.
-            async_link_down(hass, entry)
-            raise ConfigEntryNotReady(
-                f"{entry.title} ({address}) is not advertising state; "
-                "check ESPHome proxy coverage"
-            )
-        # A held AIRTAP advertises rarely, and right after a restart a proxy
-        # may still own the previous link, so the manufacturer-data frame
-        # regularly misses this window (all six fans failed setup this way on
-        # 2026-09-09). The held link normally ends the wait first: its first
-        # notification or poll response counts as ready too. Reaching here
-        # means neither arrived in time; the connectable path above is proof
-        # enough, the hold supervisor keeps connecting and GATT fills the
-        # state in; entities stay unavailable until then, which is honest.
+        # Setup never fails on a miss, held or not: Home Assistant is not
+        # "initialized" until every setup returns, and its own retry backoff
+        # would only delay a fan the integration can recover by itself. The
+        # connectable path above is proof enough that something can reach it.
+        # A held fan keeps connecting in its supervisor and takes state from
+        # GATT when it arrives; right after a restart a proxy may still own
+        # the previous link, and a held AIRTAP advertises rarely, so the
+        # window is regularly missed. An unheld fan is polled on its next
+        # advertisement once Home Assistant is running. Either way the
+        # entities stay unavailable until state arrives, and the watchdog
+        # below owns the outage clock if it never does.
         _LOGGER.info(
-            "%s (%s): no state from an advertisement or the held link within "
-            "%ss; holding the link and taking state from GATT when it arrives",
+            "%s (%s): no state within %ss of setup; the entities fill in "
+            "when it arrives (%s)",
             entry.title,
             address,
-            startup_timeout,
+            STARTUP_BUDGET,
+            "holding the link, state from GATT" if hold else "state from the next advertisement",
         )
 
     watchdog = ACInfinityLinkWatchdog(hass, entry, coordinator)

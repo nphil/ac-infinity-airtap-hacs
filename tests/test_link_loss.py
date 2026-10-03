@@ -25,6 +25,7 @@ from tests.test_link_poll import build
 def held_then_dropped():
     """A coordinator whose held link came up, the tracker gave up, then it dropped."""
     coordinator, device, hass = build()
+    coordinator._device_ready.set()  # it has had its first state
     coordinator._async_start()
     device.connected = True
     device.hold_status.set_reconnect_attempt(1)

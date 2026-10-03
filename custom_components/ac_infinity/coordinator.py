@@ -78,13 +78,15 @@ from .hold import allocation_source_for_address
 if TYPE_CHECKING:
     from .models import ACInfinityData
 
-DEVICE_STARTUP_TIMEOUT = 30
-# The same wait for a held fan, which never refuses setup on a miss (the hold
-# supervisor keeps connecting and GATT fills the state in), so a miss only
-# costs Home Assistant's startup time. Measured on the 2026-10-02 restart:
-# four links delivered state 4-7 s into setup, two only after 29 and 32 s of
-# connect retries; under the full 30 s every restart waited on the slowest.
-HELD_STARTUP_TIMEOUT = 10
+# How long config-entry setup waits for a fan's first state, held or not.
+# Home Assistant reports "initialized" only after every integration's setup
+# returns, so this wait sits directly on the startup critical path: measured
+# 2026-10-02, ac_infinity held it for the full 10 s while the links came up
+# (four delivered state 4-7 s in, two only after 29 and 32 s of retries).
+# A miss never fails setup: the radio work (the hold supervisor's connect,
+# the advertisement-driven poll) goes on in the background and the entities
+# fill in when state arrives.
+STARTUP_BUDGET = 5
 
 # Upper bound for one GATT poll (connect + subscribe + command + response).
 # bleak-retry-connector has its own per-attempt timeouts, but the worst-case
@@ -390,6 +392,11 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
     def available(self) -> bool:
         """Advertisement-based availability, widened by a live GATT link.
 
+        Nothing is available before the fan's first state (see
+        ``async_wait_ready``): setup no longer waits for it, so until then
+        the entities have no reading to show and say so by being
+        unavailable instead of a bare "unknown".
+
         A held device advertises much less often than an idle one (observed
         live), so ``async_track_unavailable`` can declare it gone while the
         integration is holding an open connection to it and commands are
@@ -399,7 +406,7 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         advertise; everything else falls through to the base class's
         advertisement logic unchanged.
         """
-        return (
+        return self._device_ready.is_set() and (
             self.controller.is_connected
             or self._cancel_link_grace is not None
             or super().available
@@ -533,14 +540,24 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         it reachable and fills its state exactly as a parseable advertisement
         does, so it also ends ``async_wait_ready``.  A held AIRTAP rarely
         advertises, so on a restart this is what normally ends that wait:
-        before it counted, the advertisement-only wait ran its full
-        DEVICE_STARTUP_TIMEOUT on every restart (measured 2026-10-02: 30.02 s,
-        the single longest item in Home Assistant's startup).
+        before it counted, the advertisement-only wait ran its full 30 s on
+        every restart (measured 2026-10-02: 30.02 s, the single longest item
+        in Home Assistant's startup).
         """
         if change is CallbackType.ADVERTISEMENT:
             return
-        self._device_ready.set()
+        first_state = self._async_mark_ready()
         self.async_update_listeners()
+        if first_state:
+            self._async_notify_health()
+
+    @callback
+    def _async_mark_ready(self) -> bool:
+        """Record the fan's first state; True only the first time."""
+        if self._device_ready.is_set():
+            return False
+        self._device_ready.set()
+        return True
 
     @callback
     def _needs_poll(
@@ -697,6 +714,7 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         # even when this particular frame carries no parseable payload.
         self.controller.update_ble_device(service_info.device)
         was_unavailable = self._was_unavailable
+        became_ready = False
         if was_unavailable:
             self._was_unavailable = False
             self.logger.info(
@@ -719,7 +737,7 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
                 )
             else:
                 if self.controller.name:
-                    self._device_ready.set()
+                    became_ready = self._async_mark_ready()
                 self.logger.debug(
                     "%s (%s) state after advertisement: %s",
                     self.ble_device.name,
@@ -729,10 +747,11 @@ class ACInfinityDataUpdateCoordinator(ActiveBluetoothDataUpdateCoordinator[None]
         # ALWAYS runs: fires entity listeners (base passive coordinator does
         # this unconditionally per dispatched event) and schedules GATT polls.
         super()._async_handle_bluetooth_event(service_info, change)
-        if was_unavailable:
+        if was_unavailable or became_ready:
             # A health transition, reported only on the flip (this runs for
             # every frame of every fan) and only after super(), which is what
-            # marks the device available again.
+            # marks the device available again.  The fan's first state is one
+            # too: before it, nothing was available.
             self._async_notify_health()
 
     @callback

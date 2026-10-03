@@ -100,9 +100,10 @@ notifies listeners; forwarding would double-render every frame).
   unloaded/reloaded cleanly and leaked `hass.data` on every attempt; also
   releases any held GATT connection (slot economy).
 - **Setup ordering** now matches core BLE integrations (switchbot pattern):
-  start coordinator → `async_wait_ready()` (raise `ConfigEntryNotReady`
-  with a proxy-coverage hint if nothing parseable arrives in 30 s) →
-  register data → forward platforms. Previously platforms were set up
+  start coordinator → `async_wait_ready()` (since 1.9.2 at most
+  `STARTUP_BUDGET` = 5 s for every fan, and a miss no longer raises
+  `ConfigEntryNotReady`: the entities stay unavailable and fill in when
+  state arrives) → register data → forward platforms. Previously platforms were set up
   before the coordinator even started, and readiness was never awaited.
 - **Entry-data normalization hardened** (`_device_info_from_entry_data`):
   filters stored dicts to known fields and coerces a serialized

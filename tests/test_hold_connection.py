@@ -383,9 +383,11 @@ class TestAvailability:
         import logging
 
         ble = SimpleNamespace(address=ADDRESS, name="D-A6B2C")
-        return ACInfinityDataUpdateCoordinator(
+        coordinator = ACInfinityDataUpdateCoordinator(
             None, logging.getLogger(__name__), ble, controller
         )
+        coordinator._device_ready.set()  # it has had its first state
+        return coordinator
 
     def test_held_device_stays_available_without_advertisements(self):
         """A held fan advertises far less often; the advertisement tracker

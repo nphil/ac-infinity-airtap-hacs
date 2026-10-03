@@ -92,7 +92,8 @@ class TestEveryFrameReachesBase:
     def test_state_over_the_held_link_marks_device_ready(self):
         """A held fan rarely advertises; its first notification or poll
         response must end the startup wait, or every restart sits out the
-        full DEVICE_STARTUP_TIMEOUT (30 s, measured 2026-10-02)."""
+        whole STARTUP_BUDGET (it sat out 30 s before the budget, measured
+        2026-10-02)."""
         for change in (CallbackType.NOTIFICATION, CallbackType.UPDATE_RESPONSE):
             coordinator, device = make_coordinator()
             coordinator._async_handle_controller_push(device.state, change)
@@ -114,6 +115,7 @@ class TestUnavailability:
         never serve stale state forever (the base flips it; the override
         must preserve that via super())."""
         coordinator, _ = make_coordinator()
+        coordinator._device_ready.set()  # it has had its first state
         assert coordinator.available is True
         coordinator._async_handle_unavailable(frame({}))
         assert coordinator.available is False
