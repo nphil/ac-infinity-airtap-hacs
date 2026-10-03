@@ -44,6 +44,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import asdict, replace
+from typing import Any
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
@@ -90,6 +91,20 @@ LINK_STEP_TIMEOUT = 10
 # proxy slot, so it gets less: a hung one must not eat the whole shutdown
 # budget (8 s) before the disconnect is even tried.
 STOP_NOTIFY_TIMEOUT = 3
+# The outer LINK_STEP_TIMEOUT guard CANCELS a step, and cancelling an ESPHome
+# proxy call mid-flight is not clean: aioesphomeapi registers the notification
+# handler before the proxy acknowledges the subscribe and removes it only on an
+# exception, not on cancellation, so an abandoned handler stays registered on
+# the proxy connection and later links deliver notifications to stale objects
+# (startup contract S8).  So each step also gets a BACKEND timeout, shorter
+# than the guard, that makes the backend run its own error path:
+# ``start_notify(timeout=)`` bounds each proxy round trip (a subscribe is up
+# to two: the subscribe, then the CCCD write), ``connect(timeout=)`` the whole
+# proxy connect.  The guard stays as a safety net only.  GATT writes and
+# stop_notify take no timeout parameter; the notification wait has its own
+# NOTIFY_TIMEOUT and the others are bounded above.
+NOTIFY_SUBSCRIBE_TIMEOUT = 4.0
+CONNECT_TIMEOUT = 8.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -115,7 +130,11 @@ class ACInfinityController:
 
         self._ble_device = ble_device
         self._advertisement_data = advertisement_data
-        self._client_class = client_class
+        self._client_class = self._bounded_client_class(client_class)
+        # True once the current connect pass has already reported a stall, so
+        # the guard that cuts off the retry that follows a timed-out attempt
+        # does not blame a second, innocent scanner.
+        self._stall_reported = False
         self._operation_lock = asyncio.Lock()
         self._state = state or parse_manufacturer_data(
             advertisement_data.manufacturer_data[MANUFACTURER_ID]  # type: ignore
@@ -134,12 +153,13 @@ class ACInfinityController:
         self._last_advertisement_monotonic: float | None = None
         self._hold_connection = False
         self._disconnect_callbacks: list[Callable[[], None]] = []
-        # Told when a freshly connected link stalls on its notification
-        # subscribe, so the owner can steer the next attempt to a different
-        # path; set by the integration, None for a bare library user.
-        self._on_stalled_link: Callable[[BleakClientWithServiceCache], None] | None = (
-            None
-        )
+        # Advisory hooks the owner may set (see ``set_link_handlers``); None
+        # for a bare library user.  ``stalled``: a connect or notification
+        # subscribe was cut off by LINK_STEP_TIMEOUT.  ``ready``: a link came
+        # up and is usable.  They let the owner steer the next attempt away
+        # from a path that hung, which this module cannot know how to do.
+        self._on_link_stalled: Callable[[], None] | None = None
+        self._on_link_ready: Callable[[], None] | None = None
         if advertisement_data is not None:
             # Being handed an advertisement at construction means one was
             # just seen (or HA's scanner cache holds a recent one); without
@@ -469,6 +489,7 @@ class ACInfinityController:
                 self._reset_disconnect_timer()
                 return
             _LOGGER.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
+            self._stall_reported = False
             try:
                 async with asyncio.timeout(LINK_STEP_TIMEOUT):
                     client = await establish_connection(
@@ -483,6 +504,8 @@ class ACInfinityController:
                 # A BleakError, not the TimeoutError: the retry decorator
                 # deliberately never retries a bare timeout, and the callers
                 # treat every BleakError as an ordinary failed attempt.
+                if not self._stall_reported:
+                    self._report_stall()
                 raise BleakConnectionError(
                     f"{self.name}: no connection within {LINK_STEP_TIMEOUT} s"
                 ) from ex
@@ -515,13 +538,18 @@ class ACInfinityController:
                 try:
                     async with asyncio.timeout(LINK_STEP_TIMEOUT):
                         await client.start_notify(
-                            self._read_char, self._notification_handler
+                            self._read_char,
+                            self._notification_handler,
+                            timeout=NOTIFY_SUBSCRIBE_TIMEOUT,
                         )
                 except TimeoutError as ex:
+                    # The backend's own timeout surfaces as a TimeoutError
+                    # too (bleak-esphome converts TimeoutAPIError), as does
+                    # the guard; both mean the subscribe stalled.
                     stalled = True
                     raise BleakConnectionError(
                         f"{self.name}: notification subscribe did not finish "
-                        f"within {LINK_STEP_TIMEOUT} s"
+                        f"within {NOTIFY_SUBSCRIBE_TIMEOUT} s"
                     ) from ex
             except BLEAK_EXCEPTIONS:
                 # Subscribing can fail transiently on a fresh link; drop the
@@ -531,19 +559,65 @@ class ACInfinityController:
                 self._read_char = None
                 self._write_char = None
                 self._expected_disconnect = True
-                if stalled and self._on_stalled_link is not None:
-                    try:
-                        self._on_stalled_link(client)
-                    except Exception:  # noqa: BLE001 - advisory hook only
-                        _LOGGER.debug(
-                            "%s: stalled-link hook failed", self.name, exc_info=True
-                        )
+                if stalled:
+                    self._report_stall()
                 await self._disconnect_unpublished(client)
                 raise
             # Publish the client only once it is fully usable, so no other
             # coroutine can observe a connection without notifications.
             self._client = client
             self._reset_disconnect_timer()
+            self._call_link_hook(self._on_link_ready)
+
+    def _bounded_client_class(self, base: type) -> type:
+        """``base`` with a backend connect timeout below the step guard.
+
+        ``establish_connection`` passes its own 20 s ``timeout`` to every
+        ``connect``; capping it here makes the backend (not our cancellation)
+        end a stalled connect, and tells the owner which attempt stalled.
+        """
+        controller = self
+
+        async def connect(client: Any, *args: Any, **kwargs: Any) -> Any:
+            kwargs["timeout"] = min(
+                kwargs.get("timeout") or CONNECT_TIMEOUT, CONNECT_TIMEOUT
+            )
+            try:
+                return await base.connect(client, *args, **kwargs)
+            except TimeoutError:
+                controller._report_stall()
+                raise
+
+        return type(
+            f"Bounded{base.__name__}",
+            (base,),
+            {"connect": connect, "__module__": __name__},
+        )
+
+    def _report_stall(self) -> None:
+        self._stall_reported = True
+        self._call_link_hook(self._on_link_stalled)
+
+    async def _bounded_disconnect(
+        self, client: BleakClientWithServiceCache, timeout: float
+    ) -> None:
+        """``client.disconnect()`` with a bound that survives cancellation.
+
+        Our own timeout cancels the disconnect, as before.  An OUTSIDE
+        cancellation (the hold task cancelled on unload while a failed attempt
+        is being torn down) must not abandon the link half open, so the
+        disconnect runs as its own task and finishes by itself.
+        """
+        task = asyncio.ensure_future(client.disconnect())
+        try:
+            async with asyncio.timeout(timeout):
+                await asyncio.shield(task)
+        except TimeoutError:
+            task.cancel()
+            raise
+        except asyncio.CancelledError:
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            raise
 
     async def _disconnect_unpublished(self, client: BleakClientWithServiceCache) -> None:
         """Drop a client whose setup failed, without waiting on it for long.
@@ -553,8 +627,7 @@ class ACInfinityController:
         and swallowed; the failure that brought us here is what gets raised.
         """
         try:
-            async with asyncio.timeout(LINK_STEP_TIMEOUT):
-                await client.disconnect()
+            await self._bounded_disconnect(client, LINK_STEP_TIMEOUT)
         except TimeoutError:
             _LOGGER.warning(
                 "%s: Disconnect of a failed connection attempt did not finish "
@@ -562,12 +635,30 @@ class ACInfinityController:
                 self.name,
                 LINK_STEP_TIMEOUT,
             )
+        except BLEAK_EXCEPTIONS:
+            _LOGGER.debug(
+                "%s: Error dropping a failed connection attempt",
+                self.name,
+                exc_info=True,
+            )
 
-    def set_stalled_link_handler(
-        self, handler: Callable[[BleakClientWithServiceCache], None] | None
+    def set_link_handlers(
+        self,
+        *,
+        on_stalled: Callable[[], None] | None = None,
+        on_ready: Callable[[], None] | None = None,
     ) -> None:
-        """Be told when a new link stalls on its notification subscribe."""
-        self._on_stalled_link = handler
+        """Be told when a connect or subscribe stalls, and when a link is usable."""
+        self._on_link_stalled = on_stalled
+        self._on_link_ready = on_ready
+
+    def _call_link_hook(self, hook: Callable[[], None] | None) -> None:
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:  # noqa: BLE001 - advisory hook only
+            _LOGGER.debug("%s: link hook failed", self.name, exc_info=True)
 
     def _notification_handler(
         self, _sender: BleakGATTCharacteristic, data: bytearray
@@ -724,8 +815,7 @@ class ACInfinityController:
                             exc_info=True,
                         )
                 try:
-                    async with asyncio.timeout(LINK_STEP_TIMEOUT):
-                        await client.disconnect()
+                    await self._bounded_disconnect(client, LINK_STEP_TIMEOUT)
                 except BLEAK_EXCEPTIONS:
                     _LOGGER.debug(
                         "%s: Error during disconnect", self.name, exc_info=True

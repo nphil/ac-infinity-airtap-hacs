@@ -47,6 +47,7 @@ from .coordinator import (
 )
 from .device import ACInfinityDevice, AutoModeConfig, DeviceInfoEx
 from .models import ACInfinityData
+from .proxy_health import STALL_AVOID_SECONDS, StalledProxies
 
 if TYPE_CHECKING:
     from homeassistant.helpers.typing import ConfigType
@@ -135,22 +136,6 @@ def _runtime_state_from_entry_data(service_data: Any) -> DeviceInfoEx:
     )
 
 
-def _record_stalled_link(client: Any) -> None:
-    """Count a stalled subscribe against the proxy that carried the link.
-
-    The connect itself succeeded, so habluetooth already cleared that
-    proxy's failure count for this fan; without this the next attempt would
-    score the same path as spotless. Best effort on habluetooth internals
-    (the same ones ble_affinity.py relies on): when they are absent the
-    one-shot bypass of the preferred proxy still applies.
-    """
-    scanner = getattr(client, "_connected_scanner", None)
-    record = getattr(scanner, "_add_connect_failure", None)
-    address = getattr(client, "address", None)
-    if callable(record) and address:
-        record(address)
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up AC Infinity from a config entry."""
     _async_register_services(hass)
@@ -180,21 +165,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     device_info = _runtime_state_from_entry_data(entry.data[CONF_SERVICE_DATA])
 
-    # One-shot: after a link stalled on its notification subscribe, the next
-    # connect ignores the preferred proxy (see _on_stalled_link).
-    skip_preferred = False
+    # Proxies that stalled an attempt for this fan are left out of the routing
+    # for a while (proxy_health.py), whichever the preferred proxy or
+    # habluetooth's own scoring would have picked. The record lives in
+    # hass.data so a reload (autoheal sweeps reload a down fan every five
+    # minutes) does not forget it. ``selected_source`` is the scanner the most
+    # recent connect was routed through; connects for one fan are serialised
+    # by the controller's connect lock, so it is the one a stall belongs to.
+    stalled_proxies = _stalled_proxies(hass, address)
+    selected_source: str | None = None
 
-    def _preferred_proxy() -> str | None:
-        nonlocal skip_preferred
-        if skip_preferred:
-            skip_preferred = False
-            return None
-        return entry.options.get(CONF_PREFERRED_PROXY) or None
+    def _on_scanner_selected(scanner: Any) -> None:
+        nonlocal selected_source
+        selected_source = getattr(scanner, "source", None)
 
-    def _on_stalled_link(client: Any) -> None:
-        nonlocal skip_preferred
-        skip_preferred = True
-        _record_stalled_link(client)
+    def _on_link_stalled() -> None:
+        if selected_source is None:
+            return
+        stalled_proxies.record(selected_source)
+        _LOGGER.info(
+            "%s (%s): a connection step through proxy %s stalled; routing "
+            "around it for %d s while another route exists",
+            entry.title,
+            address,
+            selected_source,
+            STALL_AVOID_SECONDS,
+        )
+
+    def _on_link_ready() -> None:
+        if selected_source is not None:
+            stalled_proxies.clear(selected_source)
 
     def _on_proxy_choice(_scanner_name: str, preferred_used: bool) -> None:
         device.hold_status.set_via_preferred_proxy(preferred_used)
@@ -208,11 +208,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # this class.
     client_class = make_affinity_client_class(
         bleak_retry_connector.BleakClientWithServiceCache,
-        _preferred_proxy,
+        lambda: entry.options.get(CONF_PREFERRED_PROXY) or None,
         on_choice=_on_proxy_choice,
+        is_excluded=lambda scanner: stalled_proxies.is_excluded(
+            getattr(scanner, "source", None)
+        ),
+        on_selected=_on_scanner_selected,
     )
     device = ACInfinityDevice(ble_device, device_info, client_class=client_class)
-    device.set_stalled_link_handler(_on_stalled_link)
+    device.set_link_handlers(on_stalled=_on_link_stalled, on_ready=_on_link_ready)
     device.hold_status.set_preferred_proxy(
         entry.options.get(CONF_PREFERRED_PROXY) or None
     )
@@ -411,6 +415,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """
     address: str = entry.data[CONF_ADDRESS]
     async_clear_outage(hass, address)
+    hass.data.get(DOMAIN, {}).get(STALLED_PROXIES_KEY, {}).pop(address.upper(), None)
     ir.async_delete_issue(hass, DOMAIN, unreachable_issue_id(address))
 
 
@@ -466,6 +471,15 @@ RELEASE_LINK_SCHEMA = vol.Schema(
 # unload and reload; only a Home Assistant restart clears them.
 SHUTDOWN_LATCH_KEY = "shutting_down"
 RESUME_TIMERS_KEY = "release_link_resume_timers"
+#: address -> StalledProxies; see proxy_health.py. Outlives entry reloads.
+STALLED_PROXIES_KEY = "_stalled_proxies"
+
+
+def _stalled_proxies(hass: HomeAssistant, address: str) -> StalledProxies:
+    store: dict[str, StalledProxies] = hass.data.setdefault(DOMAIN, {}).setdefault(
+        STALLED_PROXIES_KEY, {}
+    )
+    return store.setdefault(address.upper(), StalledProxies())
 
 
 def shutting_down(hass: HomeAssistant) -> bool:

@@ -43,6 +43,26 @@ what `bleak_esphome` registers from `device_info.name`), the same identity
 the integrations already store in `last_holding_proxy`. Source MAC and the
 full `scanner.name` are accepted too.
 
+Temporary exclusion (ac_infinity only; not in the shared copy)
+--------------------------------------------------------------
+habluetooth clears a scanner's failure count on every *successful* connect, so
+an attempt that connected and then hung in the notification subscribe - or one
+our own step timeout cut off - barely dents that scanner's score, and both the
+preferred proxy and habluetooth's default routing send the next attempt
+straight back to it. `is_excluded(scanner)` is an injected predicate; the
+caller backs it with its own record of scanners that stalled an attempt (see
+`proxy_health.py`) and the scanner is left out of BOTH the preferred pick and
+the default pick for as long as it says so - but only while another
+connectable route exists: a device reachable through one proxy still uses it.
+The default pick is filtered BEFORE habluetooth runs, by handing its selector
+a manager whose `async_scanner_devices_by_address` omits the excluded
+scanners, so the connection slot habluetooth reserves (local adapters
+allocate one when a backend is built) is only ever reserved for the scanner
+that is actually used; picking first and discarding afterwards would leak it.
+`on_selected(scanner)` reports every pick, preferred or default, so the caller
+knows which scanner a stalled attempt went through.
+
+
 Private-API note: the overridden method and `_async_get_backend_for_ble_device`
 are habluetooth internals (present in 6.26.x). `affinity_supported()` checks
 for them; when absent the factory returns `base` unchanged and logs once, so
@@ -54,6 +74,8 @@ from __future__ import annotations
 from collections.abc import Callable
 import logging
 from typing import Any
+
+from bleak.exc import BleakError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -98,19 +120,46 @@ def _client_address(client: Any) -> str:
     return str(getattr(client, "address", ""))
 
 
+class _FilteredManager:
+    """The habluetooth manager, minus some scanners for one address.
+
+    Handed to habluetooth's own selector so it scores and allocates a slot
+    over the allowed scanners only; every other attribute is the real
+    manager's.
+    """
+
+    def __init__(self, manager: Any, address: str, allowed: list[Any]) -> None:
+        self._manager = manager
+        self._address = address
+        self._allowed = allowed
+
+    def async_scanner_devices_by_address(self, address: str, connectable: bool) -> Any:
+        if address == self._address:
+            return list(self._allowed)
+        return self._manager.async_scanner_devices_by_address(address, connectable)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._manager, name)
+
+
 def make_affinity_client_class(
     base: type,
     preferred_getter: Callable[[], str | None],
     *,
     max_failures: int = DEFAULT_MAX_FAILURES,
     on_choice: Callable[[str, bool], None] | None = None,
+    is_excluded: Callable[[Any], bool] | None = None,
+    on_selected: Callable[[Any], None] | None = None,
 ) -> type:
     """Return ``base`` specialised to prefer one scanner.
 
     ``preferred_getter`` is called at each connect so an options change
     takes effect on the next reconnect without rebuilding the client.
     ``on_choice(scanner_name, preferred_used)`` is invoked after every
-    selection so the caller can surface which path was taken.
+    selection that preferred-proxy affinity took part in, so the caller can
+    surface which path was taken (not when no preference is configured).
+    ``is_excluded(scanner)`` and ``on_selected(scanner)``: see "Temporary
+    exclusion" in the module docstring; ``on_selected`` fires for every pick.
     """
     global _warned_unsupported
     if not affinity_supported(base):
@@ -126,16 +175,53 @@ def make_affinity_client_class(
 
     default_select = getattr(base, _SELECT)
 
+    def _default_pick(self: Any, manager: Any, address: str) -> Any:
+        """habluetooth's own pick, over the scanners not currently excluded."""
+        if is_excluded is not None:
+            devices = manager.async_scanner_devices_by_address(address, True)
+            allowed = [d for d in devices if not is_excluded(d.scanner)]
+            if allowed and len(allowed) != len(devices):
+                try:
+                    backend = default_select(
+                        self, _FilteredManager(manager, address, allowed)
+                    )
+                except BleakError:
+                    # Nothing allowed can take a connection right now (no
+                    # free slot): an excluded route beats no route. The
+                    # selector reserves nothing before it raises.
+                    pass
+                else:
+                    _LOGGER.info(
+                        "%s: routing around %d proxy(ies) that recently "
+                        "stalled a connection attempt; using %s",
+                        address,
+                        len(devices) - len(allowed),
+                        getattr(backend.scanner, "name", "?"),
+                    )
+                    return backend
+        return default_select(self, manager)
+
     def _select(self: Any, manager: Any) -> Any:
         preferred = preferred_getter()
-        if not preferred:
-            return default_select(self, manager)
-
         address = _client_address(self)
+        if not preferred:
+            backend = _default_pick(self, manager, address)
+            if on_selected is not None:
+                on_selected(backend.scanner)
+            return backend
+
         for scanner_device in manager.async_scanner_devices_by_address(address, True):
             scanner = scanner_device.scanner
             if not scanner_matches(scanner, preferred):
                 continue
+            if is_excluded is not None and is_excluded(scanner):
+                _LOGGER.info(
+                    "%s: preferred proxy %s stalled a recent connection "
+                    "attempt; using default routing for now",
+                    address,
+                    scanner.name,
+                )
+                break
             connector = getattr(scanner, "connector", None)
             if connector is None or not connector.can_connect():
                 _LOGGER.debug(
@@ -168,6 +254,8 @@ def make_affinity_client_class(
             )
             if on_choice is not None:
                 on_choice(scanner.name, True)
+            if on_selected is not None:
+                on_selected(scanner)
             return backend
         else:
             _LOGGER.debug(
@@ -177,9 +265,11 @@ def make_affinity_client_class(
                 preferred,
             )
 
-        backend = default_select(self, manager)
+        backend = _default_pick(self, manager, address)
         if on_choice is not None:
             on_choice(getattr(backend.scanner, "name", "?"), False)
+        if on_selected is not None:
+            on_selected(backend.scanner)
         return backend
 
     return type(

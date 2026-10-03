@@ -14,26 +14,24 @@ Contract pinned here:
   still raises ``ConfigEntryNotReady``;
 * until the fan's first state the entities are unavailable, and they fill in
   when it arrives after setup returned - advertisement or GATT;
-* that arrival never makes the integration send anything;
-* no single connect / subscribe / disconnect step can hang the controller
-  longer than its bound, and a link that stalled on its subscribe steers the
-  next attempt away from the same proxy.
+* that arrival never makes the integration send anything.
+
+Step bounds (S4/S8) are in test_link_steps.py; proxy routing in
+test_proxy_routing.py.
 """
 
 import asyncio
-import importlib
 import time
 from types import SimpleNamespace
 
 import pytest
-from bleak.exc import BleakError
 from homeassistant.components import bluetooth
 
 import custom_components.ac_infinity as integration
 import custom_components.ac_infinity.coordinator as coordinator_module
 from custom_components.ac_infinity.ac_infinity_ble import ACInfinityController
 from custom_components.ac_infinity.circulation import CirculationController
-from custom_components.ac_infinity.const import CONF_PREFERRED_PROXY, DOMAIN
+from custom_components.ac_infinity.const import DOMAIN
 from custom_components.ac_infinity.coordinator import ACInfinityDataUpdateCoordinator
 from custom_components.ac_infinity.device import WORK_TYPE_AUTO
 from custom_components.ac_infinity.fan import ACInfinityFan
@@ -41,14 +39,11 @@ from tests.test_coordinator_events import CHANGE, aci_frame, make_coordinator
 from tests.test_link_poll import build
 from tests.test_live_level import CAPTURES
 from tests.test_shutdown_release import (
-    ADDRESS,
     FakeCoordinator,
     FakeEntry,
     FakeHass,
     setup_env,  # noqa: F401 - fixture
 )
-
-vendored = importlib.import_module("custom_components.ac_infinity.ac_infinity_ble.device")
 
 BUDGET = 0.1  # stands in for STARTUP_BUDGET so the tests do not sleep 5 s
 
@@ -230,225 +225,3 @@ def test_the_first_state_arriving_actuates_nothing():
         return sent
 
     assert asyncio.run(scenario()) == []
-
-
-# ---------------------------------------------------------------------------
-# S4: no single step hangs
-# ---------------------------------------------------------------------------
-
-
-class StepClient:
-    """A GATT client whose steps hang on demand."""
-
-    address = ADDRESS
-    is_connected = True
-
-    def __init__(self, *, hang_subscribe=False, hang_disconnect=False, hang_stop=False):
-        self.services = SimpleNamespace(get_characteristic=lambda uuid: object())
-        self.hang_subscribe = hang_subscribe
-        self.hang_disconnect = hang_disconnect
-        self.hang_stop = hang_stop
-        self.disconnects = 0
-
-    async def start_notify(self, char, handler) -> None:
-        if self.hang_subscribe:
-            await asyncio.Event().wait()
-
-    async def stop_notify(self, char) -> None:
-        if self.hang_stop:
-            await asyncio.Event().wait()
-
-    async def disconnect(self) -> None:
-        self.disconnects += 1
-        if self.hang_disconnect:
-            await asyncio.Event().wait()
-        self.is_connected = False
-
-    async def clear_cache(self) -> None:
-        pass
-
-
-@pytest.fixture
-def fast_steps(monkeypatch):
-    monkeypatch.setattr(vendored, "LINK_STEP_TIMEOUT", 0.05)
-    monkeypatch.setattr(vendored, "STOP_NOTIFY_TIMEOUT", 0.02)
-
-
-def controller_for(client):
-    """A real controller whose connect hands back ``client`` (or hangs)."""
-    from tests.test_vendored_controller import airtap_state
-
-    ble = SimpleNamespace(address=ADDRESS, name="D-A6B2C")
-    controller = ACInfinityController(ble, state=airtap_state())
-
-    async def fake_establish(*args, **kwargs):
-        if client is None:
-            await asyncio.Event().wait()
-        return client
-
-    return controller, fake_establish
-
-
-def test_a_connect_that_never_answers_fails_fast_and_frees_the_lock(
-    fast_steps, monkeypatch
-):
-    async def scenario():
-        controller, hang = controller_for(None)
-        monkeypatch.setattr(vendored, "establish_connection", hang)
-        started = time.monotonic()
-        with pytest.raises(BleakError):  # retryable, unlike a bare TimeoutError
-            await controller._ensure_connected()
-        return time.monotonic() - started, controller
-
-    elapsed, controller = asyncio.run(scenario())
-    assert elapsed < 0.5
-    assert not controller._connect_lock.locked()
-    assert controller._client is None
-
-
-def test_a_subscribe_that_never_answers_fails_fast_and_drops_the_link(
-    fast_steps, monkeypatch
-):
-    client = StepClient(hang_subscribe=True)
-    stalled = []
-
-    async def scenario():
-        controller, establish = controller_for(client)
-        monkeypatch.setattr(vendored, "establish_connection", establish)
-        controller.set_stalled_link_handler(stalled.append)
-        started = time.monotonic()
-        with pytest.raises(BleakError):
-            await controller._ensure_connected()
-        return time.monotonic() - started, controller
-
-    elapsed, controller = asyncio.run(scenario())
-    assert elapsed < 0.5
-    assert client.disconnects == 1, "the half-open link is let go"
-    assert stalled == [client]
-    assert controller._client is None and not controller._connect_lock.locked()
-
-
-def test_a_failed_attempts_hanging_disconnect_cannot_block_the_next_attempt(
-    fast_steps, monkeypatch
-):
-    client = StepClient(hang_subscribe=True, hang_disconnect=True)
-
-    async def scenario():
-        controller, establish = controller_for(client)
-        monkeypatch.setattr(vendored, "establish_connection", establish)
-        started = time.monotonic()
-        with pytest.raises(BleakError):
-            await controller._ensure_connected()
-        return time.monotonic() - started, controller
-
-    elapsed, controller = asyncio.run(scenario())
-    assert elapsed < 0.5
-    assert not controller._connect_lock.locked()
-
-
-def test_an_ordinary_subscribe_failure_is_not_reported_as_a_stall(fast_steps, monkeypatch):
-    class Refusing(StepClient):
-        async def start_notify(self, char, handler) -> None:
-            raise BleakError("GATT error")
-
-    client = Refusing()
-    stalled = []
-
-    async def scenario():
-        controller, establish = controller_for(client)
-        monkeypatch.setattr(vendored, "establish_connection", establish)
-        controller.set_stalled_link_handler(stalled.append)
-        with pytest.raises(BleakError):
-            await controller._ensure_connected()
-
-    asyncio.run(scenario())
-    assert stalled == []
-    assert client.disconnects == 1
-
-
-def test_a_hung_stop_notify_does_not_keep_the_disconnect_from_running(fast_steps):
-    client = StepClient(hang_stop=True)
-
-    async def scenario():
-        controller, _ = controller_for(client)
-        controller._client = client
-        controller._read_char = object()
-        started = time.monotonic()
-        await controller._execute_disconnect(force=True)
-        return time.monotonic() - started, controller
-
-    elapsed, controller = asyncio.run(scenario())
-    assert client.disconnects == 1
-    assert elapsed < 0.5
-    assert not controller._connect_lock.locked()
-
-
-def test_a_hung_disconnect_is_bounded_and_frees_the_lock(fast_steps):
-    client = StepClient(hang_disconnect=True)
-
-    async def scenario():
-        controller, _ = controller_for(client)
-        controller._client = client
-        controller._read_char = object()
-        started = time.monotonic()
-        await controller._execute_disconnect(force=True)
-        return time.monotonic() - started, controller
-
-    elapsed, controller = asyncio.run(scenario())
-    assert elapsed < 0.5
-    assert not controller._connect_lock.locked()
-
-
-def test_the_step_bounds_are_within_the_contract():
-    assert vendored.LINK_STEP_TIMEOUT <= 10
-    assert vendored.STOP_NOTIFY_TIMEOUT <= vendored.LINK_STEP_TIMEOUT
-
-
-# ---------------------------------------------------------------------------
-# S4: steering the next attempt after a stalled subscribe
-# ---------------------------------------------------------------------------
-
-
-def stalled_setup(monkeypatch, setup_env, preferred):  # noqa: F811
-    """Run setup with the affinity factory captured; return (getter, device)."""
-    captured = {}
-
-    def capture(base, getter, **kwargs):
-        captured["getter"] = getter
-        return base
-
-    monkeypatch.setattr(integration, "make_affinity_client_class", capture)
-
-    async def scenario():
-        hass = FakeHass()
-        entry = FakeEntry("one", hold=False)
-        entry.options[CONF_PREFERRED_PROXY] = preferred
-        await integration.async_setup_entry(hass, entry)
-        return hass.data[DOMAIN]["one"].device
-
-    return captured, asyncio.run(scenario())
-
-
-def test_a_stalled_subscribe_skips_the_preferred_proxy_once(setup_env, monkeypatch):
-    captured, device = stalled_setup(monkeypatch, setup_env, "plant-room-proxy")
-    getter = captured["getter"]
-    assert getter() == "plant-room-proxy"
-    device._on_stalled_link(SimpleNamespace())
-    assert getter() is None, "the next connect takes habluetooth's own routing"
-    assert getter() == "plant-room-proxy", "and only that one"
-
-
-def test_a_stalled_subscribe_counts_against_the_proxy_that_carried_it():
-    failures = []
-    scanner = SimpleNamespace(_add_connect_failure=failures.append)
-    integration._record_stalled_link(
-        SimpleNamespace(_connected_scanner=scanner, address=ADDRESS)
-    )
-    assert failures == [ADDRESS]
-
-
-def test_a_habluetooth_without_the_hooks_degrades_quietly():
-    integration._record_stalled_link(SimpleNamespace(address=ADDRESS))
-    integration._record_stalled_link(
-        SimpleNamespace(_connected_scanner=SimpleNamespace(), address=ADDRESS)
-    )
